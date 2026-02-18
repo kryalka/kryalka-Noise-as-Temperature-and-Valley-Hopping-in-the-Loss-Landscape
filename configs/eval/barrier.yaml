@@ -1,0 +1,7 @@
+barrier:
+  definition: max_minus_linear_baseline
+
+  thresholds:
+    - 0.01
+    - 0.05
+    - 0.1

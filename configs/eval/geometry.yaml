@@ -1,0 +1,10 @@
+geometry:
+  alpha: 1e-3
+  num_directions: 10
+  eval_batch_size: 256
+  num_eval_batches: null
+  
+
+data:
+  num_workers: 0
+  pin_memory: true

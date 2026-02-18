@@ -1,0 +1,19 @@
+data_root: ./data
+
+path:
+  type: linear        
+  num_points: 41
+  bn_recalib_batches: 20
+  pivots: []   
+
+evaluation:
+  model_mode: eval
+  batch_size: 256
+
+metrics:
+  - val_loss
+  - val_accuracy
+
+data:
+  num_workers: 0
+  pin_memory: true
