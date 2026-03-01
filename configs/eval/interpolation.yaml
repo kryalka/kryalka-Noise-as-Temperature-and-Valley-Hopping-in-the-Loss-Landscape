@@ -9,6 +9,9 @@ path:
 evaluation:
   model_mode: eval
   batch_size: 256
+  split: val
+  val_size: 5000
+  split_seed: 42
 
 metrics:
   - val_loss

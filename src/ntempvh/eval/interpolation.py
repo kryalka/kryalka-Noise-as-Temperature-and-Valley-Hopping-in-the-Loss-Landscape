@@ -218,10 +218,10 @@ def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) 
         rows.append([float(t), float(val_loss), float(val_acc)])
 
     arr = np.array(rows, dtype=np.float64)
-    def _stem(p: str) -> str:
-        return Path(p).with_suffix("").name
+    def _safe_stem(p: str) -> str:
+        return str(Path(p).with_suffix("")).replace("/", "__").replace("\\", "__").replace(":", "_")
 
-    tag = f"interp__{path_type}__{_stem(ckpt_a)}__{_stem(ckpt_b)}.csv"
+    tag = f"interp__{path_type}__{_safe_stem(ckpt_a)}__{_safe_stem(ckpt_b)}.csv"
     out_file = Path(out_path) / tag
 
     np.savetxt(out_file, arr, delimiter=",", header="t,val_loss,val_acc", comments="")
