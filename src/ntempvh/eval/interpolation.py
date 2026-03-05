@@ -10,7 +10,14 @@ import torch.nn as nn
 from ntempvh.data.cifar import get_cifar10_loaders, get_cifar10_test_loader
 from ntempvh.models.resnet_cifar import make_model
 from ntempvh.utils.device import get_device
-from ntempvh.utils.io import ensure_dir, load_yaml
+from ntempvh.utils.io import ensure_dir, load_yaml, save_json
+from ntempvh.eval.bn import recalibrate_bn
+import hashlib
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
 
 
 def _lerp_state_dict(sd_a: dict, sd_b: dict, t: float) -> dict:
@@ -67,42 +74,41 @@ def _eval(model: nn.Module, loader, device) -> tuple[float, float]:
         return float("nan"), float("nan")
     return loss_sum / n, correct / n
 
-
 def _call_get_cifar10_loaders_safe(**kwargs):
     sig = inspect.signature(get_cifar10_loaders)
     allowed = set(sig.parameters.keys())
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     return get_cifar10_loaders(**filtered)
 
-@torch.no_grad()
-def recalibrate_bn(
-    model: nn.Module,
-    train_loader,
-    device: torch.device,
-    *,
-    num_batches: int = 50,
-) -> None:
-    """
-    Обновление running_mean / running_var у BatchNorm слоёв под текущие веса модели
-    Модель в eval, но BN-слои в train (обновятся running stats без dropout)
-    """
-    bn_layers = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
-    if not bn_layers or num_batches <= 0:
-        return
+# @torch.no_grad()
+# def recalibrate_bn(
+#     model: nn.Module,
+#     train_loader,
+#     device: torch.device,
+#     *,
+#     num_batches: int = 50,
+# ) -> None:
+#     """
+#     Обновление running_mean / running_var у BatchNorm слоёв под текущие веса модели
+#     Модель в eval, но BN-слои в train (обновятся running stats без dropout)
+#     """
+#     bn_layers = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+#     if not bn_layers or num_batches <= 0:
+#         return
 
-    model.eval()
-    for m in bn_layers:
-        m.train()
+#     model.eval()
+#     for m in bn_layers:
+#         m.train()
 
-    batches = 0
-    for x, _ in train_loader:
-        x = x.to(device, non_blocking=True)
-        _ = model(x)
-        batches += 1
-        if batches >= num_batches:
-            break
+#     batches = 0
+#     for x, _ in train_loader:
+#         x = x.to(device, non_blocking=True)
+#         _ = model(x)
+#         batches = 1
+#         if batches >= num_batches:
+#             break
 
-    model.eval()
+#     model.eval()
 
 def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) -> Path:
     """
@@ -175,11 +181,14 @@ def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) 
     #         pin_memory=bool(data_cfg.get("pin_memory", True)),
     #     )
 
+    bn_batch_size = int(eval_cfg.get("bn_batch_size", eval_batch_size))
+
     loaders = _call_get_cifar10_loaders_safe(
         root=data_root,
         batch_size=128,
         val_batch_size=eval_batch_size,
         val_size=int(eval_cfg.get("val_size", 5000)),
+        bn_batch_size=bn_batch_size,
         split_seed=int(eval_cfg.get("split_seed", 0)),
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", True)),
@@ -218,12 +227,43 @@ def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) 
         rows.append([float(t), float(val_loss), float(val_acc)])
 
     arr = np.array(rows, dtype=np.float64)
-    def _safe_stem(p: str) -> str:
-        return str(Path(p).with_suffix("")).replace("/", "__").replace("\\", "__").replace(":", "_")
+    # def _safe_stem(p: str) -> str:
+    #     return str(Path(p).with_suffix("")).replace("/", "__").replace("\\", "__").replace(":", "_")
 
-    tag = f"interp__{path_type}__{_safe_stem(ckpt_a)}__{_safe_stem(ckpt_b)}.csv"
+    # tag = f"interp__{path_type}__{_safe_stem(ckpt_a)}__{_safe_stem(ckpt_b)}.csv"
+    tag = f"interp__{path_type}__{_short_tag(ckpt_a)}__{_short_tag(ckpt_b)}.csv"
     out_file = Path(out_path) / tag
 
     np.savetxt(out_file, arr, delimiter=",", header="t,val_loss,val_acc", comments="")
+
+    meta = {
+        "ckptA": str(ckpt_a),
+        "ckptB": str(ckpt_b),
+        "model": model_name,
+        "dataset": dataset_name,
+        "data_root": data_root,
+        "path": {
+            "type": path_type,
+            "num_points": int(num_points),
+            "bn_recalib_batches": int(bn_batches),
+            "pivots": pivot_paths,
+        },
+        "evaluation": {
+            "split": eval_split,
+            "batch_size": int(eval_batch_size),
+            "val_size": int(eval_cfg.get("val_size", 5000)),
+            "split_seed": int(eval_cfg.get("split_seed", 0)),
+        },
+    }
+    for tag, ck in (("A", A), ("B", B)):
+        if isinstance(ck, dict):
+            if "epoch" in ck:
+                meta[f"epoch_{tag}"] = int(ck["epoch"])
+            if "seed" in ck:
+                meta[f"seed_{tag}"] = int(ck["seed"])
+
+    meta_path = Path(out_file).with_suffix(".meta.json")
+    save_json(meta_path, meta)
+
 
     return out_file

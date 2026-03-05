@@ -1,0 +1,2303 @@
+===== PROJECT TREE =====
+.
+├── .DS_Store
+├── .gitattributes
+├── .github
+│   └── workflows
+│       └── ci.yml
+├── .gitignore
+├── .pre-commit-config.yaml
+├── .pytest_cache
+│   ├── .gitignore
+│   ├── CACHEDIR.TAG
+│   ├── README.md
+│   └── v
+│       └── cache
+│           ├── lastfailed
+│           └── nodeids
+├── CITATION.cff
+├── configs
+│   ├── eval
+│   │   ├── barrier.yaml
+│   │   ├── geometry.yaml
+│   │   └── interpolation.yaml
+│   ├── sweeps
+│   │   └── temp_sweep.yaml
+│   └── train
+│       ├── sgd_base.yaml
+│       └── temperature_grid.yaml
+├── docs
+│   ├── definitions.md
+│   ├── figures
+│   ├── methodology.md
+│   ├── project_plan.md
+│   └── results.md
+├── experiments
+├── full_project_dump.txt
+├── LICENSE
+├── notebooks
+├── pyproject.toml
+├── README.md
+├── src
+│   ├── .DS_Store
+│   └── ntempvh
+│       ├── __init__.py
+│       ├── .DS_Store
+│       ├── cli.py
+│       ├── eval
+│       │   ├── barrier.py
+│       │   ├── bn.py
+│       │   ├── geometry.py
+│       │   ├── interpolation.py
+│       │   └── metrics.py
+│       ├── models
+│       │   └── resnet_cifar.py
+│       ├── train
+│       │   ├── optim.py
+│       │   ├── schedules.py
+│       │   └── trainer.py
+│       └── utils
+│           ├── device.py
+│           ├── io.py
+│           ├── logging.py
+│           └── seed.py
+└── tests
+    ├── test_barrier.py
+    ├── test_geometry.py
+    ├── test_interpolation.py
+    └── test_reproducibility.py
+
+21 directories, 46 files
+
+===== FILE CONTENTS =====
+
+===== ./.pre-commit-config.yaml =====
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+      - id: ruff-format
+===== ./tests/test_interpolation.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from ntempvh.eval.interpolation import run_interpolation
+
+
+@dataclass
+class _DummyLoaders:
+    train: DataLoader
+    val: DataLoader
+    bn: DataLoader
+
+class _TinyNet(nn.Module):
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(3 * 32 * 32, num_classes)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        return self.fc(x)
+
+
+def _make_dummy_loaders(
+    *,
+    n_train: int = 32,
+    n_val: int = 32,
+    batch_size: int = 16,
+    seed: int = 0,
+) -> _DummyLoaders:
+    g = torch.Generator().manual_seed(seed)
+
+    x_train = torch.randn((n_train, 3, 32, 32), generator=g)
+    y_train = torch.randint(0, 10, (n_train,), generator=g)
+    x_val = torch.randn((n_val, 3, 32, 32), generator=g)
+    y_val = torch.randint(0, 10, (n_val,), generator=g)
+
+    train_ds = TensorDataset(x_train, y_train)
+    val_ds = TensorDataset(x_val, y_val)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    bn_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    return _DummyLoaders(train=train_loader, val=val_loader, bn=bn_loader)
+
+
+def _write_interp_cfg(path: Path, *, data_root: str, num_points: int, eval_batch_size: int) -> None:
+    text = f"""\
+        data_root: {data_root}
+
+        path:
+        type: linear
+        num_points: {num_points}
+
+        evaluation:
+        model_mode: eval
+        batch_size: {eval_batch_size}
+
+        metrics:
+        - val_loss
+        - val_accuracy
+        """
+    path.write_text(text, encoding="utf-8")
+
+
+@torch.no_grad()
+def _eval_like_module(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
+    model.eval()
+    crit = nn.CrossEntropyLoss()
+    loss_sum = 0.0
+    correct = 0
+    n = 0
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = crit(logits, y)
+        loss_sum += float(loss.item()) * x.size(0)
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        n += int(x.size(0))
+    return loss_sum / max(1, n), correct / max(1, n)
+
+
+def test_run_interpolation_uses_config_and_writes_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ntempvh.eval.interpolation as interp_mod
+
+    expected_root = str(tmp_path / "my_data_root")
+    expected_eval_bs = 16
+    num_points = 5
+
+    seen = {"root": None, "val_batch_size": None}
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        seen["root"] = root
+        seen["val_batch_size"] = int(val_batch_size)
+        loaders = _make_dummy_loaders(n_train=32, n_val=32, batch_size=min(expected_eval_bs, int(val_batch_size)), seed=123)
+        return loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(interp_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(interp_mod, "make_model", fake_make_model)
+
+    torch.manual_seed(0)
+    modelA = _TinyNet(num_classes=10)
+    torch.manual_seed(1)
+    modelB = _TinyNet(num_classes=10)
+
+    ckptA = {"model": "resnet18", "dataset": "cifar10", "seed": 0, "epoch": 1, "state_dict": modelA.state_dict()}
+    ckptB = {"model": "resnet18", "dataset": "cifar10", "seed": 1, "epoch": 1, "state_dict": modelB.state_dict()}
+
+    ckptA_path = tmp_path / "A.pt"
+    ckptB_path = tmp_path / "B.pt"
+    torch.save(ckptA, ckptA_path)
+    torch.save(ckptB, ckptB_path)
+
+    cfg_path = tmp_path / "interpolation.yaml"
+    _write_interp_cfg(cfg_path, data_root=expected_root, num_points=num_points, eval_batch_size=expected_eval_bs)
+
+    out_dir = tmp_path / "out"
+    out_csv = run_interpolation(str(ckptA_path), str(ckptB_path), str(cfg_path), str(out_dir))
+
+    assert seen["root"] == expected_root
+    assert seen["val_batch_size"] == expected_eval_bs
+
+    assert out_csv.exists()
+    txt = out_csv.read_text(encoding="utf-8").strip().splitlines()
+    assert len(txt) == 1 + num_points  
+    assert txt[0].strip() == "t,val_loss,val_acc"
+
+    arr = np.loadtxt(out_csv, delimiter=",", skiprows=1)
+    assert arr.shape == (num_points, 3)
+
+    t = arr[:, 0]
+    assert np.allclose(t, np.linspace(0.0, 1.0, num_points), atol=0.0, rtol=0.0)
+
+    assert np.all(np.isfinite(arr[:, 1]))
+    assert np.all(np.isfinite(arr[:, 2]))
+
+
+def test_run_interpolation_endpoints_match_manual_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+
+    import ntempvh.eval.interpolation as interp_mod
+    device = torch.device("cpu")
+
+    expected_root = str(tmp_path / "data_root")
+    eval_bs = 16
+    num_points = 3  
+    fixed_loaders = _make_dummy_loaders(n_train=32, n_val=32, batch_size=eval_bs, seed=777)
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        return fixed_loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(interp_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(interp_mod, "make_model", fake_make_model)
+    monkeypatch.setattr(interp_mod, "get_device", lambda: device)
+
+    torch.manual_seed(123)
+    modelA = _TinyNet(num_classes=10)
+    torch.manual_seed(456)
+    modelB = _TinyNet(num_classes=10)
+
+    ckptA = {"model": "resnet18", "dataset": "cifar10", "seed": 0, "epoch": 1, "state_dict": modelA.state_dict()}
+    ckptB = {"model": "resnet18", "dataset": "cifar10", "seed": 1, "epoch": 1, "state_dict": modelB.state_dict()}
+    ckptA_path = tmp_path / "A.pt"
+    ckptB_path = tmp_path / "B.pt"
+    torch.save(ckptA, ckptA_path)
+    torch.save(ckptB, ckptB_path)
+
+    cfg_path = tmp_path / "interpolation.yaml"
+    _write_interp_cfg(cfg_path, data_root=expected_root, num_points=num_points, eval_batch_size=eval_bs)
+
+    out_dir = tmp_path / "out"
+    out_csv = run_interpolation(str(ckptA_path), str(ckptB_path), str(cfg_path), str(out_dir))
+    arr = np.loadtxt(out_csv, delimiter=",", skiprows=1)
+
+    mA = _TinyNet(num_classes=10)
+    mA.load_state_dict(modelA.state_dict(), strict=True)
+    lossA, accA = _eval_like_module(mA, fixed_loaders.val, device)
+
+    mB = _TinyNet(num_classes=10)
+    mB.load_state_dict(modelB.state_dict(), strict=True)
+    lossB, accB = _eval_like_module(mB, fixed_loaders.val, device)
+
+    assert abs(arr[0, 1] - lossA) < 1e-10
+    assert abs(arr[0, 2] - accA) < 1e-10
+
+    assert abs(arr[-1, 1] - lossB) < 1e-10
+    assert abs(arr[-1, 2] - accB) < 1e-10
+===== ./tests/test_barrier.py =====
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+
+from ntempvh.eval.barrier import compute_barrier
+
+
+def _write_interp_csv(path: Path, t: np.ndarray, val_loss: np.ndarray, val_acc: np.ndarray | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if val_acc is None:
+        val_acc = np.full_like(val_loss, np.nan, dtype=float)
+
+    arr = np.stack([t, val_loss, val_acc], axis=1)
+    header = "t,val_loss,val_acc"
+    np.savetxt(path, arr, delimiter=",", header=header, comments="")
+
+
+def _write_barrier_cfg(path: Path, definition: str, thresholds: list[float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    txt = (
+        "barrier:\n"
+        f"  definition: {definition}\n"
+        "  thresholds:\n"
+        + "".join([f"    - {x}\n" for x in thresholds])
+    )
+    path.write_text(txt, encoding="utf-8")
+
+
+def test_compute_barrier_outputs_json_and_csv(tmp_path: Path) -> None:
+
+    interp_csv = tmp_path / "some" / "nested" / "interp.csv"
+
+    t = np.linspace(0.0, 1.0, 5)
+    val_loss = np.array([1.0, 1.05, 1.2, 1.05, 1.0], dtype=float)
+    val_acc = np.array([0.5, 0.55, 0.52, 0.56, 0.6], dtype=float)
+    _write_interp_csv(interp_csv, t, val_loss, val_acc)
+
+    cfg_path = tmp_path / "cfg" / "barrier.yaml"
+    thresholds = [0.01, 0.05, 0.1]
+    _write_barrier_cfg(cfg_path, definition="max_minus_endpoints", thresholds=thresholds)
+
+    out_dir = tmp_path / "out"
+    json_path = compute_barrier(str(interp_csv), str(cfg_path), str(out_dir))
+
+    assert isinstance(json_path, Path)
+    assert json_path.exists()
+    assert json_path.parent.resolve() == out_dir.resolve()
+    assert json_path.suffix == ".json"
+    assert json_path.name.startswith("barrier__")
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+
+    assert payload["interp_csv"] == str(interp_csv)
+    assert payload["definition"] == "max_minus_endpoints"
+    assert abs(payload["L0"] - 1.0) < 1e-9
+    assert abs(payload["L1"] - 1.0) < 1e-9
+    assert abs(payload["max_L"] - 1.2) < 1e-9
+    assert abs(payload["peak_t"] - 0.5) < 1e-9
+
+    assert abs(payload["DeltaL"] - 0.2) < 1e-9
+
+    jumps = payload["jumps"]
+    for eps in thresholds:
+        assert jumps[str(eps)] is True
+
+    csv_path = out_dir / "barriers.csv"
+    assert csv_path.exists()
+
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 2  
+
+    header = lines[0].split(",")
+    assert header[:7] == ["interp_csv", "definition", "L0", "L1", "max_L", "peak_t", "DeltaL"]
+
+    for eps in thresholds:
+        assert f"jump_eps_{eps}" in header
+
+    row = lines[-1].split(",")
+    assert row[0] == str(interp_csv)
+    assert row[1] == "max_minus_endpoints"
+
+
+def test_compute_barrier_linear_baseline_definition(tmp_path: Path) -> None:
+    interp_csv = tmp_path / "interp.csv"
+
+    t = np.array([0.0, 0.5, 1.0], dtype=float)
+    val_loss = np.array([1.0, 1.8, 2.0], dtype=float)
+    _write_interp_csv(interp_csv, t, val_loss)
+
+    cfg_path = tmp_path / "barrier.yaml"
+    _write_barrier_cfg(cfg_path, definition="max_minus_linear_baseline", thresholds=[0.25, 0.35])
+
+    out_dir = tmp_path / "out"
+    json_path = compute_barrier(str(interp_csv), str(cfg_path), str(out_dir))
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["definition"] == "max_minus_linear_baseline"
+
+    assert abs(payload["DeltaL"] - 0.3) < 1e-9
+    assert payload["jumps"]["0.25"] is True
+    assert payload["jumps"]["0.35"] is False
+===== ./tests/test_geometry.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from ntempvh.eval.geometry import compute_geometry
+
+
+@dataclass
+class _DummyLoaders:
+    train: DataLoader
+    val: DataLoader
+    bn: DataLoader
+
+
+class _TinyNet(nn.Module):
+
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(3 * 32 * 32, num_classes)
+
+    def forward(self, x):
+        x = self.flatten(x)
+        return self.fc(x)
+
+
+def _make_dummy_loaders(
+    *,
+    n_train: int = 32,
+    n_val: int = 32,
+    batch_size: int = 16,
+    seed: int = 0,
+) -> _DummyLoaders:
+    g = torch.Generator().manual_seed(seed)
+
+    x_train = torch.randn((n_train, 3, 32, 32), generator=g)
+    y_train = torch.randint(0, 10, (n_train,), generator=g)
+    x_val = torch.randn((n_val, 3, 32, 32), generator=g)
+    y_val = torch.randint(0, 10, (n_val,), generator=g)
+
+    train_ds = TensorDataset(x_train, y_train)
+    val_ds = TensorDataset(x_val, y_val)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    bn_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    return _DummyLoaders(train=train_loader, val=val_loader, bn=bn_loader)
+
+
+def _write_geometry_cfg(path: Path) -> None:
+    text = """\
+        data_root: ./data
+        geometry:
+        alpha: 1e-3
+        num_directions: 2
+        eval_batch_size: 16
+        num_eval_batches: 1
+        """
+    path.write_text(text, encoding="utf-8")
+
+
+def test_compute_geometry_creates_json_and_csv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import ntempvh.eval.geometry as geom_mod
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        loaders = _make_dummy_loaders(n_train=32, n_val=32, batch_size=min(16, int(val_batch_size)), seed=123)
+        return loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(geom_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(geom_mod, "make_model", fake_make_model)
+
+    torch.manual_seed(0)
+    model = _TinyNet(num_classes=10)
+    ckpt = {
+        "model": "resnet18",   
+        "dataset": "cifar10",
+        "seed": 0,
+        "epoch": 1,
+        "state_dict": model.state_dict(),
+    }
+    ckpt_path = tmp_path / "final.pt"
+    torch.save(ckpt, ckpt_path)
+
+    cfg_path = tmp_path / "geometry.yaml"
+    _write_geometry_cfg(cfg_path)
+
+    out_dir = tmp_path / "out"
+    json_path = compute_geometry(str(ckpt_path), str(cfg_path), str(out_dir))
+
+    assert json_path.exists()
+    data = json_path.read_text(encoding="utf-8")
+    assert '"kappa_tr"' in data
+    assert '"epsilon"' in data
+    assert '"base"' in data
+
+    csv_path = out_dir / "geometries.csv"
+    assert csv_path.exists()
+    lines = csv_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 2 
+    assert lines[0].startswith("ckpt,model,dataset,alpha,num_directions")
+
+
+def test_compute_geometry_deterministic_under_fixed_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+
+    import ntempvh.eval.geometry as geom_mod
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        loaders = _make_dummy_loaders(n_train=32, n_val=32, batch_size=min(16, int(val_batch_size)), seed=999)
+        return loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(geom_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(geom_mod, "make_model", fake_make_model)
+
+    torch.manual_seed(0)
+    model = _TinyNet(num_classes=10)
+    ckpt = {"model": "resnet18", "dataset": "cifar10", "seed": 0, "epoch": 1, "state_dict": model.state_dict()}
+    ckpt_path = tmp_path / "final.pt"
+    torch.save(ckpt, ckpt_path)
+
+    cfg_path = tmp_path / "geometry.yaml"
+    _write_geometry_cfg(cfg_path)
+
+    out_dir1 = tmp_path / "out1"
+    out_dir2 = tmp_path / "out2"
+
+    torch.manual_seed(12345)
+    j1 = compute_geometry(str(ckpt_path), str(cfg_path), str(out_dir1))
+
+    torch.manual_seed(12345)
+    j2 = compute_geometry(str(ckpt_path), str(cfg_path), str(out_dir2))
+
+    import json
+    d1 = json.loads(j1.read_text(encoding="utf-8"))
+    d2 = json.loads(j2.read_text(encoding="utf-8"))
+
+    assert np.isfinite(d1["kappa_tr"])
+    assert np.isfinite(d2["kappa_tr"])
+    assert abs(float(d1["kappa_tr"]) - float(d2["kappa_tr"])) < 1e-10
+===== ./tests/test_reproducibility.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+import json
+
+import numpy as np
+import pytest
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from ntempvh.train.trainer import train_one_run
+from ntempvh.eval.interpolation import run_interpolation
+
+
+@dataclass
+class _DummyLoaders:
+    train: DataLoader
+    val: DataLoader
+    bn: DataLoader
+
+
+class _TinyNet(nn.Module):
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(3 * 32 * 32, num_classes)
+
+    def forward(self, x):
+        return self.fc(self.flatten(x))
+
+
+def _make_dummy_loaders(
+    *,
+    n_train: int = 64,
+    n_val: int = 64,
+    batch_size: int = 16,
+    seed: int = 0,
+) -> _DummyLoaders:
+    g = torch.Generator().manual_seed(seed)
+
+    x_train = torch.randn((n_train, 3, 32, 32), generator=g)
+    y_train = torch.randint(0, 10, (n_train,), generator=g)
+    x_val = torch.randn((n_val, 3, 32, 32), generator=g)
+    y_val = torch.randint(0, 10, (n_val,), generator=g)
+
+    train_ds = TensorDataset(x_train, y_train)
+    val_ds = TensorDataset(x_val, y_val)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    bn_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    return _DummyLoaders(train=train_loader, val=val_loader, bn=bn_loader)
+
+def _base_train_cfg(*, epochs: int = 2, batch_size: int = 16, lr: float = 0.1) -> dict:
+    return {
+        "dataset": "cifar10",
+        "model": "resnet18",
+        "data_root": "IGNORED_IN_TESTS",
+        "training": {
+            "optimizer": "sgd",
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "learning_rate": lr,
+            "momentum": 0.0,
+            "weight_decay": 0.0,
+            "nesterov": False,
+            "scheduler": "none",
+        },
+        "logging": {
+            "save_every_epochs": 0,  
+            "save_final": True,
+            "save_best": False,    
+        },
+    }
+
+
+def _write_interp_cfg(path: Path, *, data_root: str, num_points: int, eval_batch_size: int) -> None:
+    text = f"""\
+        data_root: {data_root}
+        path:
+        type: linear
+        num_points: {num_points}
+        evaluation:
+        model_mode: eval
+        batch_size: {eval_batch_size}
+        metrics:
+        - val_loss
+        - val_accuracy
+        """
+    path.write_text(text, encoding="utf-8")
+
+
+def _state_dict_allclose(sd1: dict, sd2: dict, *, atol: float = 0.0, rtol: float = 0.0) -> bool:
+    if sd1.keys() != sd2.keys():
+        return False
+    for k in sd1.keys():
+        t1 = sd1[k]
+        t2 = sd2[k]
+        if isinstance(t1, torch.Tensor) and isinstance(t2, torch.Tensor):
+            if t1.shape != t2.shape:
+                return False
+            if not torch.allclose(t1.cpu(), t2.cpu(), atol=atol, rtol=rtol):
+                return False
+        else:
+            if t1 != t2:
+                return False
+    return True
+
+
+def test_train_one_run_deterministic_given_seed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ntempvh.train.trainer as trainer_mod
+
+    fixed_loaders = _make_dummy_loaders(n_train=64, n_val=64, batch_size=16, seed=999)
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        return fixed_loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(trainer_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(trainer_mod, "make_model", fake_make_model)
+    monkeypatch.setattr(trainer_mod, "get_device", lambda: torch.device("cpu"))
+
+    cfg = _base_train_cfg(epochs=2, batch_size=16, lr=0.05)
+
+    out1 = tmp_path / "run1"
+    out2 = tmp_path / "run2"
+
+    seed = 12345
+    ckpt1 = train_one_run(cfg, seed=seed, out_dir=str(out1))
+    ckpt2 = train_one_run(cfg, seed=seed, out_dir=str(out2))
+
+    assert ckpt1.exists()
+    assert ckpt2.exists()
+
+    A = torch.load(ckpt1, map_location="cpu")
+    B = torch.load(ckpt2, map_location="cpu")
+
+    assert A["model"] == B["model"]
+    assert A["dataset"] == B["dataset"]
+    assert int(A["epoch"]) == int(B["epoch"])
+
+    assert _state_dict_allclose(A["state_dict"], B["state_dict"], atol=0.0, rtol=0.0)
+
+
+def test_interpolation_deterministic_given_fixed_ckpts_and_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ntempvh.eval.interpolation as interp_mod
+
+    fixed_loaders = _make_dummy_loaders(n_train=32, n_val=32, batch_size=16, seed=2024)
+
+    def fake_get_cifar10_loaders(*, root, batch_size, num_workers=2, pin_memory=True, val_batch_size=256):
+        return fixed_loaders
+
+    def fake_make_model(name: str, num_classes: int):
+        return _TinyNet(num_classes=num_classes)
+
+    monkeypatch.setattr(interp_mod, "get_cifar10_loaders", fake_get_cifar10_loaders)
+    monkeypatch.setattr(interp_mod, "make_model", fake_make_model)
+    monkeypatch.setattr(interp_mod, "get_device", lambda: torch.device("cpu"))
+
+    torch.manual_seed(0)
+    modelA = _TinyNet(num_classes=10)
+    torch.manual_seed(1)
+    modelB = _TinyNet(num_classes=10)
+
+    ckptA_path = tmp_path / "A.pt"
+    ckptB_path = tmp_path / "B.pt"
+    torch.save({"model": "resnet18", "dataset": "cifar10", "state_dict": modelA.state_dict()}, ckptA_path)
+    torch.save({"model": "resnet18", "dataset": "cifar10", "state_dict": modelB.state_dict()}, ckptB_path)
+
+    cfg_path = tmp_path / "interpolation.yaml"
+    _write_interp_cfg(cfg_path, data_root="IGNORED", num_points=7, eval_batch_size=16)
+
+    out1 = tmp_path / "out1"
+    out2 = tmp_path / "out2"
+
+    torch.manual_seed(123)
+    csv1 = run_interpolation(str(ckptA_path), str(ckptB_path), str(cfg_path), str(out1))
+
+    torch.manual_seed(123)
+    csv2 = run_interpolation(str(ckptA_path), str(ckptB_path), str(cfg_path), str(out2))
+
+    a1 = np.loadtxt(csv1, delimiter=",", skiprows=1)
+    a2 = np.loadtxt(csv2, delimiter=",", skiprows=1)
+
+    assert a1.shape == a2.shape
+    assert np.allclose(a1, a2, atol=0.0, rtol=0.0)
+===== ./configs/sweeps/temp_sweep.yaml =====
+
+===== ./configs/train/sgd_base.yaml =====
+dataset: cifar10
+model: resnet18
+
+data_root: ./data
+
+data:
+  val_size: 5000
+  split_seed: 42
+  num_workers: 0
+  pin_memory: true
+
+training:
+  optimizer: sgd
+  epochs: 40
+  batch_size: 128
+  learning_rate: 0.1
+  momentum: 0.9
+  weight_decay: 5e-4
+  nesterov: true
+  scheduler: none
+
+logging:
+  save_every_epochs: 1
+  save_final: true
+
+===== ./configs/train/temperature_grid.yaml =====
+
+===== ./configs/eval/geometry.yaml =====
+geometry:
+  alpha: 1e-3
+  num_directions: 10
+  eval_batch_size: 256
+  num_eval_batches: null
+  bn_recalib_batches: 20
+
+evaluation:
+  split: val
+  val_size: 5000
+  split_seed: 42
+
+data:
+  num_workers: 0
+  pin_memory: true
+
+===== ./configs/eval/interpolation.yaml =====
+data_root: ./data
+
+path:
+  type: linear        
+  num_points: 41
+  bn_recalib_batches: 20
+  pivots: []   
+
+evaluation:
+  model_mode: eval
+  batch_size: 256
+  bn_batch_size: 256
+  split: val
+  val_size: 5000
+  split_seed: 42
+
+metrics:
+  - val_loss
+  - val_accuracy
+
+data:
+  num_workers: 0
+  pin_memory: true
+===== ./configs/eval/barrier.yaml =====
+barrier:
+  definition: max_minus_linear_baseline
+
+  thresholds:
+    - 0.01
+    - 0.05
+    - 0.1
+===== ./.github/workflows/ci.yml =====
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Run tests
+        run: |
+          pytest -q
+===== ./src/ntempvh/__init__.py =====
+
+===== ./src/ntempvh/utils/logging.py =====
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict
+
+from .io import append_jsonl, ensure_dir
+
+
+@dataclass
+class RunLogger:
+    out_dir: Path
+
+    def __post_init__(self) -> None:
+        ensure_dir(self.out_dir)
+
+    @property
+    def metrics_path(self) -> Path:
+        return self.out_dir / "metrics.jsonl"
+
+    def log(self, record: Dict[str, Any]) -> None:
+        append_jsonl(self.metrics_path, record)
+
+===== ./src/ntempvh/utils/device.py =====
+import torch
+
+
+def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+===== ./src/ntempvh/utils/io.py =====
+from __future__ import annotations
+import json
+from pathlib import Path
+from typing import Any, Dict
+
+import yaml
+
+
+def ensure_dir(path: str | Path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def load_yaml(path: str | Path) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def save_json(path: str | Path, obj: Any) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def append_jsonl(path: str | Path, obj: Dict[str, Any]) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+===== ./src/ntempvh/utils/seed.py =====
+import random
+import numpy as np
+import torch
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+===== ./src/ntempvh/models/resnet_cifar.py =====
+from __future__ import annotations
+import torch.nn as nn
+from torchvision.models import resnet18, resnet34
+
+
+def _adapt_resnet_for_cifar(m: nn.Module) -> nn.Module:
+    m.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+    m.maxpool = nn.Identity()
+    return m
+
+
+def make_model(name: str, num_classes: int) -> nn.Module:
+    name = name.lower()
+    if name == "resnet18":
+        m = resnet18(num_classes=num_classes)
+        return _adapt_resnet_for_cifar(m)
+    if name == "resnet34":
+        m = resnet34(num_classes=num_classes)
+        return _adapt_resnet_for_cifar(m)
+    raise ValueError(f"Unknown model: {name}")
+
+===== ./src/ntempvh/cli.py =====
+from __future__ import annotations
+import argparse
+from pathlib import Path
+
+from ntempvh.utils.io import load_yaml, ensure_dir
+from ntempvh.train.trainer import train_one_run
+from ntempvh.eval.interpolation import run_interpolation
+from ntempvh.eval.barrier import compute_barrier
+from ntempvh.eval.geometry import compute_geometry
+
+import hashlib
+import json
+
+# def _timestamp() -> str:
+#     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def _short_hash(obj) -> str:
+    s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
+
+def _format_run_id(cfg: dict, seed: int) -> str:
+    tr = cfg.get("training", {}) or {}
+    dataset = str(cfg.get("dataset", "data")).lower()
+    model = str(cfg.get("model", "model")).lower()
+
+    opt = str(tr.get("optimizer", "sgd")).lower()
+    lr = tr.get("learning_rate", "na")
+    bs = tr.get("batch_size", "na")
+    wd = tr.get("weight_decay", "na")
+    mom = tr.get("momentum", "na")
+    sch = str(tr.get("scheduler", "none")).lower()
+
+    # h = _short_hash({"cfg": cfg, "seed": int(seed)})
+    fingerprint = {
+        "dataset": dataset,
+        "model": model,
+        "training": tr,
+        "data_root": cfg.get("data_root"),
+        "data": cfg.get("data", {}),
+        "seed": int(seed),
+    }
+    h = _short_hash(fingerprint)
+
+    return f"{dataset}_{model}_seed{seed}__opt{opt}_lr{lr}_bs{bs}_wd{wd}_mom{mom}_sch{sch}__{h}"
+
+def main():
+    ap = argparse.ArgumentParser(prog="ntempvh")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_train = sub.add_parser("train", help="Train one run")
+    p_train.add_argument("--config", required=True)
+    p_train.add_argument("--seed", type=int, required=True)
+    p_train.add_argument("--out", default="outputs/runs")
+    p_train.add_argument("--dry_run", action="store_true")
+
+    p_interp = sub.add_parser("interpolate", help="Interpolate between two checkpoints")
+    p_interp.add_argument("--ckptA", required=True)
+    p_interp.add_argument("--ckptB", required=True)
+    p_interp.add_argument("--config", required=True) 
+    # p_interp.add_argument("--out", default="outputs/figures/interp")
+    p_interp.add_argument("--out", default="outputs/artifacts/interp")
+
+    p_bar = sub.add_parser("barrier", help="Compute barrier from interpolation csv")
+    p_bar.add_argument("--interp_csv", required=True)
+    p_bar.add_argument("--config", required=True)  
+    # p_bar.add_argument("--out", default="outputs/tables")
+    p_bar.add_argument("--out", default="outputs/artifacts/barrier")
+
+    p_geo = sub.add_parser("geometry", help="Compute proxy geometry (curvature) at a checkpoint")
+    p_geo.add_argument("--ckpt", required=True)
+    p_geo.add_argument("--config", required=True)
+    # p_geo.add_argument("--out", default="outputs/tables")
+    p_geo.add_argument("--out", default="outputs/artifacts/geometry")
+
+    args = ap.parse_args()
+
+    if args.cmd == "train":
+        cfg = load_yaml(args.config)
+
+        train_cfg = cfg.get("training", {})
+        if train_cfg.get("batch_size") in (None, "TBD"):
+            train_cfg["batch_size"] = 128
+        if train_cfg.get("learning_rate") in (None, "TBD"):
+            train_cfg["learning_rate"] = 0.1
+        cfg["training"] = train_cfg
+
+        # run_id = f"{cfg['dataset']}_{cfg['model']}_seed{args.seed}"
+        # base_out = ensure_dir(Path(args.out))
+        # run_dir = ensure_dir(base_out / f"{run_id}")
+
+        run_id = _format_run_id(cfg, args.seed)
+        base_out = ensure_dir(Path(args.out))
+        run_dir = ensure_dir(base_out / run_id)
+
+        manifest = {
+            "cmd": "train",
+            "config_path": str(args.config),
+            "seed": int(args.seed),
+            "out_root": str(base_out),
+            "run_id": str(run_id),
+            "run_dir": str(run_dir),
+            "cfg_fingerprint": {
+                "dataset": str(cfg.get("dataset", "")),
+                "model": str(cfg.get("model", "")),
+                "training": cfg.get("training", {}),
+                "data_root": cfg.get("data_root"),
+                "data": cfg.get("data", {}),
+            },
+        }
+        (run_dir / "cli_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if args.dry_run:
+            print("DRY RUN: created run dir and manifest, training not started.")
+            print(f"run dir: {run_dir}")
+            return
+
+        ckpt_path = train_one_run(cfg, seed=args.seed, out_dir=str(run_dir))
+        print(f"expected metrics: {run_dir / 'metrics.jsonl'}")
+        print(f"expected summary: {run_dir / 'summary.json'}")
+        print(f"checkpoints dir: {run_dir / 'checkpoints'}")
+        print(f"saved checkpoint: {ckpt_path}")
+        print(f"run dir: {run_dir}")
+        return
+
+    if args.cmd == "interpolate":
+        out_dir = str(ensure_dir(Path(args.out)))
+        out_csv = run_interpolation(args.ckptA, args.ckptB, args.config, out_dir)
+        print(f"saved interpolation: {out_csv}")
+        return
+
+    if args.cmd == "barrier":
+        out_file = compute_barrier(args.interp_csv, args.config, args.out)
+        print(f"saved barrier: {out_file}")
+        return
+    
+    if args.cmd == "geometry":
+        out_file = compute_geometry(args.ckpt, args.config, args.out)
+        print(f"saved geometry: {out_file}")
+        return
+
+
+if __name__ == "__main__":
+    main()
+
+===== ./src/ntempvh/train/trainer.py =====
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import torch
+import torch.nn as nn
+from tqdm import tqdm
+
+from ntempvh.data.cifar import get_cifar10_loaders
+from ntempvh.models.resnet_cifar import make_model
+from ntempvh.train.optim import make_optimizer
+from ntempvh.train.schedules import make_scheduler, step_scheduler
+from ntempvh.utils.device import get_device
+from ntempvh.utils.io import ensure_dir, save_json
+from ntempvh.utils.logging import RunLogger
+from ntempvh.utils.seed import set_seed
+
+import inspect
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader, device: torch.device) -> Dict[str, float]:
+    model.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    loss_sum = 0.0
+    correct = 0
+    n = 0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss_sum += float(criterion(logits, y).item())
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        n += int(x.size(0))
+
+    return {
+        "val_loss": loss_sum / max(1, n),
+        "val_acc": correct / max(1, n),
+    }
+
+def _call_get_cifar10_loaders_safe(**kwargs):
+    sig = inspect.signature(get_cifar10_loaders)
+    allowed = set(sig.parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_cifar10_loaders(**filtered)
+
+def _save_checkpoint(
+    ckpt_dir: Path,
+    tag: str,
+    *,
+    model_name: str,
+    dataset_name: str,
+    seed: int,
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[object],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Path:
+    ckpt = {
+        "model": model_name,
+        "dataset": dataset_name,
+        "seed": int(seed),
+        "epoch": int(epoch),
+        "state_dict": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+    }
+    if extra:
+        ckpt.update(extra)
+
+    path = ckpt_dir / f"{tag}.pt"
+    torch.save(ckpt, path)
+    return path
+
+
+def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
+    device = get_device()
+    set_seed(seed)
+
+    out_path = ensure_dir(out_dir)
+    ckpt_dir = ensure_dir(out_path / "checkpoints")
+    logger = RunLogger(out_path)
+
+    dataset_name = str(config["dataset"]).lower()
+    model_name = str(config["model"]).lower()
+    train_cfg: Dict[str, Any] = dict(config["training"])
+
+    log_cfg: Dict[str, Any] = dict(config.get("logging", {}))
+    save_every_epochs = int(log_cfg.get("save_every_epochs", 0) or 0)
+    save_final = bool(log_cfg.get("save_final", True))
+    save_best = bool(log_cfg.get("save_best", True))
+
+    epochs = int(train_cfg["epochs"])
+    batch_size = int(train_cfg["batch_size"])
+
+    data_root = str(config.get("data_root", "./data"))
+
+    data_cfg: Dict[str, Any] = dict(config.get("data", {}))
+    val_size = int(data_cfg.get("val_size", 5000))
+    split_seed = int(data_cfg.get("split_seed", 0))
+    num_workers = int(data_cfg.get("num_workers", 0))  
+    pin_memory = bool(data_cfg.get("pin_memory", device.type in ("cuda",)))  
+
+    loaders = _call_get_cifar10_loaders_safe(
+        root=data_root,
+        batch_size=batch_size,
+        val_size=val_size,
+        split_seed=split_seed,
+        shuffle_seed=seed,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    model = make_model(model_name, num_classes=10).to(device)
+    optimizer = make_optimizer(train_cfg, model)
+    scheduler = make_scheduler(train_cfg, optimizer)
+    criterion = nn.CrossEntropyLoss()
+
+    save_json(out_path / "run_config.json", {"seed": int(seed), "device": str(device), **config})
+
+    best_val_loss = float("inf")
+    best_ckpt_path: Optional[Path] = None
+
+    t0 = time.time()
+    for ep in range(1, epochs + 1):
+        model.train()
+        pbar = tqdm(loaders.train, desc=f"epoch {ep}/{epochs}", leave=False)
+
+        running_loss = 0.0
+        seen = 0
+        correct_train = 0
+
+        for x, y in pbar:
+            x = x.to(device)
+            y = y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = criterion(logits, y)
+            pred = logits.argmax(dim=1)
+            correct_train += int((pred == y).sum().item())
+            loss.backward()
+            optimizer.step()
+
+            running_loss += float(loss.item()) * x.size(0)
+            seen += x.size(0)
+
+            pbar.set_postfix(
+                train_loss=running_loss / max(1, seen),
+                lr=float(optimizer.param_groups[0]["lr"]),
+            )
+
+        step_scheduler(scheduler)
+
+        val = evaluate(model, loaders.val, device)
+        train_loss_ep = running_loss / max(1, seen)
+        train_acc_ep = correct_train / max(1, seen)
+
+        logger.log({
+            "epoch": int(ep),
+            "train_loss": float(train_loss_ep),
+            "train_acc": float(train_acc_ep),
+            "val_loss": float(val["val_loss"]),
+            "val_acc": float(val["val_acc"]),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "seconds_elapsed": float(time.time() - t0),
+        })
+
+        print(f"[ep {ep:03d}] val_loss={val['val_loss']:.4f} val_acc={val['val_acc']:.4f} train_acc={train_acc_ep:.4f}")
+
+        if save_best and val["val_loss"] < best_val_loss:
+            best_val_loss = float(val["val_loss"])
+            best_ckpt_path = _save_checkpoint(
+                ckpt_dir,
+                "best",
+                model_name=model_name,
+                dataset_name=dataset_name,
+                seed=seed,
+                epoch=ep,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                extra={"best_val_loss": best_val_loss},
+            )
+
+        if save_every_epochs > 0 and (ep % save_every_epochs == 0):
+            _save_checkpoint(
+                ckpt_dir,
+                f"epoch_{ep:03d}",
+                model_name=model_name,
+                dataset_name=dataset_name,
+                seed=seed,
+                epoch=ep,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
+
+    final_ckpt_path: Path
+    if save_final:
+        final_ckpt_path = _save_checkpoint(
+            ckpt_dir,
+            "final",
+            model_name=model_name,
+            dataset_name=dataset_name,
+            seed=seed,
+            epoch=epochs,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+    else:
+        final_ckpt_path = ckpt_dir / "final.pt"
+        torch.save(
+            {
+                "model": model_name,
+                "dataset": dataset_name,
+                "seed": int(seed),
+                "epoch": int(epochs),
+                "state_dict": model.state_dict(),
+            },
+            final_ckpt_path,
+        )
+
+    save_json(out_path / "summary.json", {
+        "epochs": int(epochs),
+        "seconds_total": float(time.time() - t0),
+        "final_checkpoint": str(final_ckpt_path),
+        "best_checkpoint": str(best_ckpt_path) if best_ckpt_path is not None else None,
+        "best_val_loss": float(best_val_loss) if best_val_loss < float("inf") else None,
+        "save_every_epochs": int(save_every_epochs),
+        "data": {
+            "data_root": data_root,
+            "val_size": val_size,
+            "split_seed": split_seed,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+    })
+
+    return final_ckpt_path
+===== ./src/ntempvh/train/optim.py =====
+from __future__ import annotations
+import torch
+from torch import nn
+from torch.optim import Optimizer
+
+
+def make_optimizer(cfg: dict, model: nn.Module) -> Optimizer:
+    opt_name = cfg.get("optimizer", "sgd").lower()
+    lr = float(cfg["learning_rate"])
+    wd = float(cfg.get("weight_decay", 0.0))
+    momentum = float(cfg.get("momentum", 0.0))
+
+    if opt_name == "sgd":
+        return torch.optim.SGD(
+            model.parameters(),
+            lr=lr,
+            momentum=momentum,
+            weight_decay=wd,
+            nesterov=bool(cfg.get("nesterov", True)),
+        )
+    raise ValueError(f"Unknown optimizer: {opt_name}")
+
+===== ./src/ntempvh/train/schedules.py =====
+from __future__ import annotations
+import torch
+from torch.optim import Optimizer
+
+
+def make_scheduler(cfg: dict, optimizer: Optimizer):
+    name = cfg.get("scheduler", "cosine")
+    epochs = int(cfg["epochs"])
+
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    if name == "none" or name is None:
+        return None
+    raise ValueError(f"Unknown scheduler: {name}")
+
+
+def step_scheduler(scheduler) -> None:
+    if scheduler is not None:
+        scheduler.step()
+
+===== ./src/ntempvh/eval/metrics.py =====
+from __future__ import annotations
+
+from typing import Optional, Any
+
+import torch
+import torch.nn as nn
+
+
+@torch.no_grad()
+def eval_classification(
+    model: nn.Module,
+    loader: Any,
+    device: torch.device,
+    *,
+    max_batches: Optional[int] = None,
+) -> dict[str, float]:
+    """
+    Подсчет итогового loss/accuracy на даталоадере для сравнения моделей и чекпоинтов (опционально на первых N батчах)
+    """
+    model.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    loss_sum = 0.0
+    correct = 0
+    n = 0
+    batches_seen = 0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits = model(x)
+        loss_sum += float(criterion(logits, y).item())
+
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        n += int(x.size(0))
+        batches_seen += 1
+
+        if max_batches is not None and batches_seen >= max_batches:
+            break
+
+    if n <= 0:
+        return {"loss": float("nan"), "acc": float("nan"), "n": 0.0, "batches": 0.0}
+
+    return {
+        "loss": loss_sum / n,
+        "acc": correct / n,
+        "n": float(n),
+        "batches": float(batches_seen),
+    }
+
+
+def params_to_vector(model: nn.Module) -> torch.Tensor:
+    """
+    Упаковка параметров модели в один вектор для геометрических и интерполяционных экспериментов
+    """
+    return torch.nn.utils.parameters_to_vector(list(model.parameters()))
+
+
+def vector_to_params(model: nn.Module, vec: torch.Tensor) -> None:
+    torch.nn.utils.vector_to_parameters(vec, list(model.parameters()))
+===== ./src/ntempvh/eval/interpolation.py =====
+from __future__ import annotations
+
+from pathlib import Path
+import inspect
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+from ntempvh.data.cifar import get_cifar10_loaders, get_cifar10_test_loader
+from ntempvh.models.resnet_cifar import make_model
+from ntempvh.utils.device import get_device
+from ntempvh.utils.io import ensure_dir, load_yaml, save_json
+from ntempvh.eval.bn import recalibrate_bn
+import hashlib
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
+
+
+def _lerp_state_dict(sd_a: dict, sd_b: dict, t: float) -> dict:
+    """
+    Формирование промежуточной модели для анализа связности мод (mode connectivity) по линейной интерполяции весов
+    """
+    out = {}
+    for k in sd_a.keys():
+        a = sd_a[k]
+        b = sd_b[k]
+
+        is_bn_buf = ("running_mean" in k) or ("running_var" in k) or ("num_batches_tracked" in k)
+        if is_bn_buf or (hasattr(a, "is_floating_point") and (not a.is_floating_point())):
+            out[k] = a.clone()
+            continue
+
+        out[k] = (1.0 - t) * a + t * b
+    return out
+
+def _interp_state_dicts_piecewise(
+    sds: list[dict],
+    t: float,
+) -> dict:
+    """
+    Piecewise-linear interpolation through a sequence of checkpoints:
+    sd[0] -> sd[1] -> ... -> sd[K-1].
+    t in [0,1] is mapped to a segment and local tau in [0,1].
+    """
+    k = len(sds) - 1
+    u = float(np.clip(t, 0.0, 1.0)) * k
+    i = int(min(k - 1, max(0, np.floor(u))))
+    tau = u - i
+    return _lerp_state_dict(sds[i], sds[i + 1], float(tau))
+
+@torch.no_grad()
+def _eval(model: nn.Module, loader, device) -> tuple[float, float]:
+    """
+    Подсчет целевой метрики качества на сплите (loss/accuracy) для сравнения точек вдоль интерполяционного пути
+    """
+    model.eval()
+    criterion = nn.CrossEntropyLoss(reduction="sum")
+
+    loss_sum, correct, n = 0.0, 0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+
+        loss_sum += float(criterion(logits, y).item())
+        pred = logits.argmax(dim=1)
+        correct += int((pred == y).sum().item())
+        n += int(x.size(0))
+
+    if n <= 0:
+        return float("nan"), float("nan")
+    return loss_sum / n, correct / n
+
+def _call_get_cifar10_loaders_safe(**kwargs):
+    sig = inspect.signature(get_cifar10_loaders)
+    allowed = set(sig.parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_cifar10_loaders(**filtered)
+
+# @torch.no_grad()
+# def recalibrate_bn(
+#     model: nn.Module,
+#     train_loader,
+#     device: torch.device,
+#     *,
+#     num_batches: int = 50,
+# ) -> None:
+#     """
+#     Обновление running_mean / running_var у BatchNorm слоёв под текущие веса модели
+#     Модель в eval, но BN-слои в train (обновятся running stats без dropout)
+#     """
+#     bn_layers = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+#     if not bn_layers or num_batches <= 0:
+#         return
+
+#     model.eval()
+#     for m in bn_layers:
+#         m.train()
+
+#     batches = 0
+#     for x, _ in train_loader:
+#         x = x.to(device, non_blocking=True)
+#         _ = model(x)
+#         batches = 1
+#         if batches >= num_batches:
+#             break
+
+#     model.eval()
+
+def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) -> Path:
+    """
+    Вывод кривой барьера (loss/acc) вдоль пути между двумя чекпоинтами 
+    """
+    cfg = load_yaml(config_path)
+
+    path_cfg = cfg.get("path", {}) if isinstance(cfg, dict) else {}
+    if path_cfg is None:
+        path_cfg = {}
+
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if data_cfg is None:
+        data_cfg = {}
+
+    num_points = int(path_cfg.get("num_points", cfg.get("num_points", 41)))
+    bn_batches = int(path_cfg.get("bn_recalib_batches", cfg.get("bn_recalib_batches", 0)))
+
+    path_type = str(path_cfg.get("type", "linear")).strip().lower()
+    pivot_paths = path_cfg.get("pivots", []) or []
+    pivot_paths = [str(p) for p in pivot_paths]
+
+    eval_cfg = cfg.get("evaluation", {}) if isinstance(cfg, dict) else {}
+    if eval_cfg is None:
+        eval_cfg = {}
+
+    data_root = str(cfg.get("data_root", "./data"))
+    eval_batch_size = int(eval_cfg.get("batch_size", cfg.get("batch_size", 256)))
+    eval_split = str(eval_cfg.get("split", cfg.get("split", "val"))).strip().lower()
+
+    device = get_device()
+    out_path = ensure_dir(out_dir)
+
+    A = torch.load(ckpt_a, map_location="cpu")
+    B = torch.load(ckpt_b, map_location="cpu")
+
+    model_name = str(A["model"]).lower()
+    dataset_name = str(A.get("dataset", "")).lower() 
+
+    sd_list = [A["state_dict"]]
+
+    for p in pivot_paths:
+        P = torch.load(p, map_location="cpu")
+        sd_list.append(P["state_dict"])
+
+    sd_list.append(B["state_dict"])
+
+    # sdA = A["state_dict"]
+    # sdB = B["state_dict"]
+
+    # if eval_split == "val":
+    #     loaders = _call_get_cifar10_loaders_safe(
+    #         root=data_root,
+    #         batch_size=128,  
+    #         val_batch_size=eval_batch_size,
+    #         val_size=int(eval_cfg.get("val_size", 5000)),
+    #         split_seed=int(eval_cfg.get("split_seed", 0)),
+    #         num_workers=int(data_cfg.get("num_workers", 0)),
+    #         pin_memory=bool(data_cfg.get("pin_memory", True)),
+    #     )
+    #     eval_loader = loaders.val
+    #     train_loader = loaders.train
+        
+
+    # elif eval_split == "test":
+    #     eval_loader = get_cifar10_test_loader(
+    #         root=data_root,
+    #         batch_size=eval_batch_size,
+    #         num_workers=int(data_cfg.get("num_workers", 0)),
+    #         pin_memory=bool(data_cfg.get("pin_memory", True)),
+    #     )
+
+    bn_batch_size = int(eval_cfg.get("bn_batch_size", eval_batch_size))
+
+    loaders = _call_get_cifar10_loaders_safe(
+        root=data_root,
+        batch_size=128,
+        val_batch_size=eval_batch_size,
+        val_size=int(eval_cfg.get("val_size", 5000)),
+        bn_batch_size=bn_batch_size,
+        split_seed=int(eval_cfg.get("split_seed", 0)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", True)),
+    )
+    bn_loader = loaders.bn  
+    if bn_loader is None:
+        bn_loader = getattr(loaders, "train", None) or getattr(loaders, "val", None)
+
+    if eval_split == "val":
+        eval_loader = loaders.val
+    elif eval_split == "test":
+        eval_loader = get_cifar10_test_loader(
+            root=data_root,
+            batch_size=eval_batch_size,
+            num_workers=int(data_cfg.get("num_workers", 0)),
+            pin_memory=bool(data_cfg.get("pin_memory", True)),
+        )
+
+    model = make_model(model_name, num_classes=10).to(device)
+
+    ts = np.linspace(0.0, 1.0, num_points)
+    rows = []
+    for t in ts:
+        if path_type == "linear":
+            sd = _lerp_state_dict(sd_list[0], sd_list[-1], float(t))
+        elif path_type in ("polyline", "piecewise", "piecewise_linear"):
+            sd = _interp_state_dicts_piecewise(sd_list, float(t))
+        else:
+            raise ValueError(f"Unknown path.type: {path_type}")
+
+        model.load_state_dict(sd, strict=True)
+
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+
+        val_loss, val_acc = _eval(model, eval_loader, device)
+        rows.append([float(t), float(val_loss), float(val_acc)])
+
+    arr = np.array(rows, dtype=np.float64)
+    def _safe_stem(p: str) -> str:
+        return str(Path(p).with_suffix("")).replace("/", "__").replace("\\", "__").replace(":", "_")
+
+    # tag = f"interp__{path_type}__{_safe_stem(ckpt_a)}__{_safe_stem(ckpt_b)}.csv"
+    tag = f"interp__{path_type}__{_short_tag(ckpt_a)}__{_short_tag(ckpt_b)}.csv"
+    out_file = Path(out_path) / tag
+
+    np.savetxt(out_file, arr, delimiter=",", header="t,val_loss,val_acc", comments="")
+
+    meta = {
+        "ckptA": str(ckpt_a),
+        "ckptB": str(ckpt_b),
+        "model": model_name,
+        "dataset": dataset_name,
+        "data_root": data_root,
+        "path": {
+            "type": path_type,
+            "num_points": int(num_points),
+            "bn_recalib_batches": int(bn_batches),
+            "pivots": pivot_paths,
+        },
+        "evaluation": {
+            "split": eval_split,
+            "batch_size": int(eval_batch_size),
+            "val_size": int(eval_cfg.get("val_size", 5000)),
+            "split_seed": int(eval_cfg.get("split_seed", 0)),
+        },
+    }
+    for tag, ck in (("A", A), ("B", B)):
+        if isinstance(ck, dict):
+            if "epoch" in ck:
+                meta[f"epoch_{tag}"] = int(ck["epoch"])
+            if "seed" in ck:
+                meta[f"seed_{tag}"] = int(ck["seed"])
+
+    meta_path = Path(out_file).with_suffix(".meta.json")
+    save_json(meta_path, meta)
+
+
+    return out_file
+===== ./src/ntempvh/eval/barrier.py =====
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from ntempvh.utils.io import load_yaml, save_json
+import hashlib
+from pathlib import Path
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
+
+
+def _parse_interp_csv(interp_csv: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Чтение CSV интерполяции (t, loss, acc); возвращает отсортированные по t массивы
+    """
+    arr = np.loadtxt(interp_csv, delimiter=",", skiprows=1)
+
+    t = arr[:, 0].astype(np.float64)
+    L = arr[:, 1].astype(np.float64)
+    if arr.shape[1] >= 3:
+        acc = arr[:, 2].astype(np.float64)
+    else:
+        acc = np.full_like(L, np.nan)
+
+    order = np.argsort(t)
+    return t[order], L[order], acc[order]
+
+
+def _compute_deltaL(t: np.ndarray, L: np.ndarray, definition: str) -> tuple[float, float, float]:
+    """
+    Подсчет высоты барьера DeltaL по выбранному определению; возвращает (DeltaL, L0, L1)
+    """
+    L0 = float(L[0])
+    L1 = float(L[-1])
+    max_L = float(L.max())
+
+    d = (definition or "").strip().lower()
+
+    if d in ("max_loss_minus_endpoints", "max_minus_endpoints", "endpoints"):
+        deltaL = max_L - max(L0, L1)
+        return float(deltaL), L0, L1
+
+    if d in ("max_minus_linear_baseline", "max_loss_minus_linear_baseline", "max_minus_linear", "linear"):
+        baseline = (1.0 - t) * L0 + t * L1
+        deltaL = float(np.max(L - baseline))
+        return float(deltaL), L0, L1
+
+    raise ValueError(f"Unknown barrier definition: {definition}")
+
+
+def _safe_stem(p: Path) -> str:
+    return str(p).replace("/", "__").replace("\\", "__").replace(":", "_")
+
+
+def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Path:
+    """
+    Вычисление барьерв по CSV + YAML-конфигу 
+    """
+    cfg = load_yaml(barrier_cfg_path)
+    bcfg = cfg.get("barrier", {}) if isinstance(cfg, dict) else {}
+
+    definition = str(bcfg.get("definition", "max_minus_endpoints"))
+    thresholds = [float(x) for x in bcfg.get("thresholds", [0.01, 0.05, 0.1])]
+
+    t, L, acc = _parse_interp_csv(interp_csv)
+    meta = None
+    meta_path = Path(interp_csv).with_suffix(".meta.json")
+    if meta_path.exists():
+        try:
+            import json
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = None
+    # deltaL, L0, L1 = _compute_deltaL(t, L, definition=definition)
+    # max_L = float(L.max())
+    # peak_idx = int(L.argmax())
+    # peak_t = float(t[peak_idx])
+    deltaL, L0, L1 = _compute_deltaL(t, L, definition=definition)
+
+    d = (definition or "").strip().lower()
+    max_L = float(L.max())
+
+    if d in ("max_minus_linear_baseline", "max_loss_minus_linear_baseline", "max_minus_linear", "linear"):
+        baseline = (1.0 - t) * L0 + t * L1
+        diff = L - baseline
+        peak_idx = int(np.argmax(diff))
+        peak_t = float(t[peak_idx])
+        max_diff = float(np.max(diff))
+    else:
+        peak_idx = int(np.argmax(L))
+        peak_t = float(t[peak_idx])
+        max_diff = None
+
+    eps = 1e-12
+    deltaL_rel = float(deltaL / (0.5 * (L0 + L1) + eps))
+
+    jumps = {str(th): bool(deltaL > th) for th in thresholds}
+
+    out: dict[str, Any] = {
+        "interp_csv": str(interp_csv),
+        "definition": definition,
+        "L0": float(L0),
+        "L1": float(L1),
+        "max_L": float(max_L),
+        "peak_t": float(peak_t),
+        "DeltaL": float(deltaL),
+        "DeltaL_rel": float(deltaL_rel),
+        "max_diff": max_diff,
+        "thresholds": thresholds,
+        "jumps": jumps,
+    }
+
+    if meta is not None:
+        out["path"] = meta.get("path", None)
+        out["evaluation"] = meta.get("evaluation", None)
+
+    out_dir = Path(out_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    interp_p = Path(interp_csv)
+    # tag = _safe_stem(interp_p.with_suffix(""))
+    # json_path = out_dir / f"barrier__{tag}.json"
+    tag = _short_tag(Path(interp_csv).with_suffix(""))
+    json_path = out_dir / f"barrier__{tag}.json"
+    save_json(json_path, out)
+
+    # csv_path = out_dir / "barriers.csv"
+    thr_sig = "_".join([str(x).replace(".", "p") for x in thresholds])
+    def_sig = (definition or "").strip().lower().replace(" ", "_")
+    csv_path = out_dir / f"barriers__{def_sig}__thr_{thr_sig}.csv"
+
+    header = "interp_csv,definition,L0,L1,max_L,peak_t,DeltaL,DeltaL_rel," + ",".join(
+        [f"jump_eps_{th}" for th in thresholds]
+    )
+    row = [
+        str(interp_csv),
+        definition,
+        f"{L0:.10g}",
+        f"{L1:.10g}",
+        f"{max_L:.10g}",
+        f"{peak_t:.10g}",
+        f"{deltaL:.10g}",
+        f"{deltaL_rel:.10g}",
+    ] + [str(int(jumps[str(th)])) for th in thresholds]
+
+    # if not csv_path.exists():
+    #     csv_path.write_text(header + "\n", encoding="utf-8")
+    # with open(csv_path, "a", encoding="utf-8") as f:
+    #     f.write(",".join(row) + "\n")
+
+
+    legacy_csv_path = out_dir / "barriers.csv"
+
+    legacy_header = "interp_csv,definition,L0,L1,max_L,peak_t,DeltaL," + ",".join(
+        [f"jump_eps_{th}" for th in thresholds]
+    )
+
+    legacy_row = [
+        str(interp_csv),
+        definition,
+        f"{L0:.10g}",
+        f"{L1:.10g}",
+        f"{max_L:.10g}",
+        f"{peak_t:.10g}",
+        f"{deltaL:.10g}",
+    ] + [str(int(jumps[str(th)])) for th in thresholds]
+
+    if not legacy_csv_path.exists():
+        legacy_csv_path.write_text(legacy_header + "\n", encoding="utf-8")
+    with open(legacy_csv_path, "a", encoding="utf-8") as f:
+        f.write(",".join(legacy_row) + "\n")
+        
+    return json_path
+===== ./src/ntempvh/eval/geometry.py =====
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+
+from ntempvh.data.cifar import get_cifar10_loaders
+from ntempvh.models.resnet_cifar import make_model
+from ntempvh.utils.device import get_device
+from ntempvh.utils.io import ensure_dir, load_yaml, save_json
+from ntempvh.eval.metrics import eval_classification, params_to_vector, vector_to_params
+from ntempvh.eval.bn import recalibrate_bn
+import inspect
+import hashlib
+from pathlib import Path
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
+
+def _call_get_cifar10_loaders_safe(**kwargs):
+    sig = inspect.signature(get_cifar10_loaders)
+    allowed = set(sig.parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_cifar10_loaders(**filtered)
+
+
+def _safe_stem(p: Path) -> str:
+    return str(p).replace("/", "__").replace("\\", "__").replace(":", "_")
+
+
+def _sample_unit_directions(
+    d: int, m: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """
+    Сэмплирование m случайных единичных направлений в R^d (по норме L2)
+    """
+    z = torch.randn((m, d), device=device, dtype=dtype)
+    z_norm = torch.norm(z, dim=1, keepdim=True).clamp_min(1e-12)
+    return z / z_norm
+
+
+@torch.no_grad()
+def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> Path:
+    """
+    Оценка локальной кривизны около чекпоинта по случайным направлениям
+    """
+    cfg = load_yaml(geometry_cfg_path)
+    gcfg = cfg.get("geometry", {}) if isinstance(cfg, dict) else {}
+    if gcfg is None:
+        gcfg = {}
+
+    alpha = float(gcfg.get("alpha", cfg.get("alpha", 1e-3)))
+    m = int(gcfg.get("num_directions", cfg.get("num_directions", 10)))
+    eval_batch_size = int(gcfg.get("eval_batch_size", cfg.get("eval_batch_size", 256)))
+    bn_batches = int(gcfg.get("bn_recalib_batches", cfg.get("bn_recalib_batches", 0)))
+
+    num_eval_batches = gcfg.get("num_eval_batches", cfg.get("num_eval_batches", None))
+    num_eval_batches = int(num_eval_batches) if num_eval_batches is not None else None
+
+    device = get_device()
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model_name = str(ckpt["model"]).lower()
+    dataset_name = str(ckpt.get("dataset", "")).lower()
+
+    data_root = str(cfg.get("data_root", "./data"))
+
+    eval_cfg = cfg.get("evaluation", {}) if isinstance(cfg, dict) else {}
+    if eval_cfg is None:
+        eval_cfg = {}
+
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if data_cfg is None:
+        data_cfg = {}
+
+
+    loaders = _call_get_cifar10_loaders_safe(
+        root=data_root,
+        batch_size=eval_batch_size,
+        val_batch_size=eval_batch_size,
+        val_size=int(eval_cfg.get("val_size", 5000)),
+        split_seed=int(eval_cfg.get("split_seed", 0)),
+        shuffle_seed=int(eval_cfg.get("split_seed", 0)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", True)),
+    )
+    val_loader = loaders.val
+    bn_loader = loaders.bn
+
+    model = make_model(model_name, num_classes=10).to(device)
+    model.load_state_dict(ckpt["state_dict"], strict=True)
+    model.eval()
+
+    recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+
+    base = eval_classification(model, val_loader, device, max_batches=num_eval_batches)
+    L0 = float(base["loss"])
+
+    theta0 = params_to_vector(model).detach().to(device)
+    dtype = theta0.dtype
+
+    theta_norm = float(torch.norm(theta0).item())
+    eps = float(alpha * theta_norm)
+    if not np.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"Bad epsilon computed: eps={eps}, alpha={alpha}, ||theta||={theta_norm}")
+
+    d = int(theta0.numel())
+    U = _sample_unit_directions(d, m, device=device, dtype=dtype)
+
+    per_dir: list[float] = []
+    for i in range(m):
+        u = U[i]
+
+        theta_plus = theta0 + eps * u
+        vector_to_params(model, theta_plus)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+        Lp = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
+
+        theta_minus = theta0 - eps * u
+        vector_to_params(model, theta_minus)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+        Lm = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
+
+        vector_to_params(model, theta0)
+
+        sec = (Lp + Lm - 2.0 * L0) / (eps * eps)
+        per_dir.append(float(sec))
+
+    kappa_tr = float(np.mean(per_dir)) if len(per_dir) > 0 else float("nan")
+    kappa_std = float(np.std(per_dir, ddof=1)) if len(per_dir) > 1 else 0.0
+
+    out_dir = ensure_dir(out_path)
+    # tag = _safe_stem(Path(ckpt_path).with_suffix(""))
+    # json_path = Path(out_dir) / f"geometry__{tag}.json"
+    tag = _short_tag(ckpt_path)
+    json_path = Path(out_dir) / f"geometry__{tag}.json"
+
+    out: dict[str, Any] = {
+        "ckpt": str(ckpt_path),
+        "dataset": dataset_name,
+        "model": model_name,
+        "device": str(device),
+        "alpha": alpha,
+        "num_directions": m,
+        "eval_batch_size": eval_batch_size,
+        "num_eval_batches": num_eval_batches,
+        "bn_recalib_batches": bn_batches,
+        "theta_norm": theta_norm,
+        "epsilon": eps,
+        "base": base,
+        "kappa_tr": kappa_tr,
+        "kappa_tr_std": kappa_std,
+        "per_direction": per_dir,
+    }
+    save_json(json_path, out)
+
+    csv_path = Path(out_dir) / "geometries.csv"
+    header = (
+        "ckpt,model,dataset,alpha,num_directions,eval_batch_size,num_eval_batches,"
+        "theta_norm,epsilon,base_loss,base_acc,kappa_tr,kappa_tr_std"
+    )
+    row = [
+        str(ckpt_path),
+        model_name,
+        dataset_name,
+        f"{alpha:.10g}",
+        str(m),
+        str(eval_batch_size),
+        "" if num_eval_batches is None else str(num_eval_batches),
+        f"{theta_norm:.10g}",
+        f"{eps:.10g}",
+        f"{L0:.10g}",
+        f"{float(base['acc']):.10g}",
+        f"{kappa_tr:.10g}",
+        f"{kappa_std:.10g}",
+    ]
+
+    if not csv_path.exists():
+        csv_path.write_text(header + "\n", encoding="utf-8")
+    with open(csv_path, "a", encoding="utf-8") as f:
+        f.write(",".join(row) + "\n")
+
+    return json_path
+===== ./src/ntempvh/eval/bn.py =====
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+@torch.no_grad()
+def recalibrate_bn(
+    model: nn.Module,
+    loader,
+    device: torch.device,
+    *,
+    num_batches: int = 50,
+) -> None:
+    """
+    Обновление running_mean / running_var у BatchNorm слоёв под текущие веса модели.
+    Модель в eval, но BN-слои в train (обновятся running stats без dropout).
+    """
+    bn_layers = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
+    if not bn_layers or num_batches <= 0 or loader is None:
+        return
+
+    model.eval()
+    for m in bn_layers:
+        m.train()
+
+    batches = 0
+    for x, _ in loader:
+        x = x.to(device, non_blocking=True)
+        _ = model(x)
+        batches += 1
+        if batches >= num_batches:
+            break
+
+    model.eval()
+===== ./src/ntempvh/data/cifar.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2470, 0.2435, 0.2616)
+
+
+@dataclass
+class DataLoaders:
+    train: DataLoader
+    val: DataLoader
+    bn: DataLoader 
+
+
+def _build_transforms(*, train: bool) -> transforms.Compose:
+    """
+    Сбор пайплайна преобразований для train (с аугментацией) или val/test (без аугментации)
+    """
+    if train:
+        return transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+            ]
+        )
+
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+        ]
+    )
+
+
+def _seed_worker(worker_id: int) -> None:
+    """
+    Фиксация seed numpy/random в воркере DataLoader для воспроизводимости
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def get_cifar10_loaders(
+    root: str,
+    batch_size: int,
+    *,
+    val_size: int = 5000,
+    split_seed: int = 0,
+    shuffle_seed: int | None = None,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    val_batch_size: int = 256,
+    bn_batch_size: int | None = None
+) -> DataLoaders:
+    """
+    Возвращает train/val DataLoader'ы CIFAR-10 с фиксированным разбиением 
+    """
+
+    bn_bs = int(bn_batch_size) if bn_batch_size is not None else int(val_batch_size)
+
+
+    tf_train = _build_transforms(train=True)
+    tf_eval = _build_transforms(train=False)
+
+    train_full_aug = datasets.CIFAR10(root=root, train=True, download=True, transform=tf_train)
+    train_full_noaug = datasets.CIFAR10(root=root, train=True, download=True, transform=tf_eval)
+
+    n = len(train_full_aug)
+
+    g_split = torch.Generator()
+    g_split.manual_seed(int(split_seed))
+    perm = torch.randperm(n, generator=g_split).tolist()
+
+    if val_size == 0:
+        train_idx = perm
+        val_idx: list[int] = []
+    else:
+        val_idx = perm[:val_size]
+        train_idx = perm[val_size:]
+
+    train_ds = Subset(train_full_aug, train_idx)
+    val_ds = Subset(train_full_noaug, val_idx)
+    bn_ds = Subset(train_full_noaug, train_idx)
+
+    if shuffle_seed is None:
+        shuffle_seed = int(split_seed)
+
+    g_loader = torch.Generator()
+    g_loader.manual_seed(int(shuffle_seed))
+
+    use_workers = int(num_workers) > 0
+    worker_init = _seed_worker if use_workers else None
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=int(batch_size),
+        shuffle=True,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        worker_init_fn=worker_init,
+        generator=g_loader,
+        persistent_workers=use_workers,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=bn_bs,
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        worker_init_fn=worker_init,
+        generator=g_loader,
+        persistent_workers=use_workers,
+    )
+
+    bn_loader = DataLoader(
+        bn_ds,
+        batch_size=bn_bs,
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        worker_init_fn=worker_init,
+        generator=g_loader,
+        persistent_workers=use_workers,
+    )
+
+    return DataLoaders(train=train_loader, val=val_loader, bn=bn_loader)
+
+
+def get_cifar10_test_loader(
+    root: str,
+    *,
+    batch_size: int = 256,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+) -> DataLoader:
+    """
+    Возвращает test DataLoader CIFAR-10 (без аугментаций) с фиксированным seed
+    """
+    tf_eval = _build_transforms(train=False)
+    test_ds = datasets.CIFAR10(root=root, train=False, download=True, transform=tf_eval)
+
+    g_loader = torch.Generator()
+    g_loader.manual_seed(0)
+
+    use_workers = int(num_workers) > 0
+    worker_init = _seed_worker if use_workers else None
+
+    return DataLoader(
+        test_ds,
+        batch_size=int(batch_size),
+        shuffle=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        worker_init_fn=worker_init,
+        generator=g_loader,
+        persistent_workers=use_workers,
+    )

@@ -6,6 +6,13 @@ from typing import Any
 import numpy as np
 
 from ntempvh.utils.io import load_yaml, save_json
+import hashlib
+from pathlib import Path
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
 
 
 def _parse_interp_csv(interp_csv: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -84,9 +91,11 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
         diff = L - baseline
         peak_idx = int(np.argmax(diff))
         peak_t = float(t[peak_idx])
+        max_diff = float(np.max(diff))
     else:
         peak_idx = int(np.argmax(L))
         peak_t = float(t[peak_idx])
+        max_diff = None
 
     eps = 1e-12
     deltaL_rel = float(deltaL / (0.5 * (L0 + L1) + eps))
@@ -102,6 +111,7 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
         "peak_t": float(peak_t),
         "DeltaL": float(deltaL),
         "DeltaL_rel": float(deltaL_rel),
+        "max_diff": max_diff,
         "thresholds": thresholds,
         "jumps": jumps,
     }
@@ -114,11 +124,17 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
     out_dir.mkdir(parents=True, exist_ok=True)
 
     interp_p = Path(interp_csv)
-    tag = _safe_stem(interp_p.with_suffix(""))
+    # tag = _safe_stem(interp_p.with_suffix(""))
+    # json_path = out_dir / f"barrier__{tag}.json"
+    tag = _short_tag(Path(interp_csv).with_suffix(""))
     json_path = out_dir / f"barrier__{tag}.json"
     save_json(json_path, out)
 
-    csv_path = out_dir / "barriers.csv"
+    # csv_path = out_dir / "barriers.csv"
+    thr_sig = "_".join([str(x).replace(".", "p") for x in thresholds])
+    def_sig = (definition or "").strip().lower().replace(" ", "_")
+    csv_path = out_dir / f"barriers__{def_sig}__thr_{thr_sig}.csv"
+
     header = "interp_csv,definition,L0,L1,max_L,peak_t,DeltaL,DeltaL_rel," + ",".join(
         [f"jump_eps_{th}" for th in thresholds]
     )
@@ -133,9 +149,31 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
         f"{deltaL_rel:.10g}",
     ] + [str(int(jumps[str(th)])) for th in thresholds]
 
-    if not csv_path.exists():
-        csv_path.write_text(header + "\n", encoding="utf-8")
-    with open(csv_path, "a", encoding="utf-8") as f:
-        f.write(",".join(row) + "\n")
+    # if not csv_path.exists():
+    #     csv_path.write_text(header + "\n", encoding="utf-8")
+    # with open(csv_path, "a", encoding="utf-8") as f:
+    #     f.write(",".join(row) + "\n")
 
+
+    legacy_csv_path = out_dir / "barriers.csv"
+
+    legacy_header = "interp_csv,definition,L0,L1,max_L,peak_t,DeltaL," + ",".join(
+        [f"jump_eps_{th}" for th in thresholds]
+    )
+
+    legacy_row = [
+        str(interp_csv),
+        definition,
+        f"{L0:.10g}",
+        f"{L1:.10g}",
+        f"{max_L:.10g}",
+        f"{peak_t:.10g}",
+        f"{deltaL:.10g}",
+    ] + [str(int(jumps[str(th)])) for th in thresholds]
+
+    if not legacy_csv_path.exists():
+        legacy_csv_path.write_text(legacy_header + "\n", encoding="utf-8")
+    with open(legacy_csv_path, "a", encoding="utf-8") as f:
+        f.write(",".join(legacy_row) + "\n")
+        
     return json_path

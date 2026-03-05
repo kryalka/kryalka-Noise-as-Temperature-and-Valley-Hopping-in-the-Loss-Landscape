@@ -31,7 +31,6 @@ def _format_run_id(cfg: dict, seed: int) -> str:
     sch = str(tr.get("scheduler", "none")).lower()
 
     # h = _short_hash({"cfg": cfg, "seed": int(seed)})
-    
     fingerprint = {
         "dataset": dataset,
         "model": model,
@@ -52,6 +51,7 @@ def main():
     p_train.add_argument("--config", required=True)
     p_train.add_argument("--seed", type=int, required=True)
     p_train.add_argument("--out", default="outputs/runs")
+    p_train.add_argument("--dry_run", action="store_true")
 
     p_interp = sub.add_parser("interpolate", help="Interpolate between two checkpoints")
     p_interp.add_argument("--ckptA", required=True)
@@ -92,7 +92,32 @@ def main():
         base_out = ensure_dir(Path(args.out))
         run_dir = ensure_dir(base_out / run_id)
 
+        manifest = {
+            "cmd": "train",
+            "config_path": str(args.config),
+            "seed": int(args.seed),
+            "out_root": str(base_out),
+            "run_id": str(run_id),
+            "run_dir": str(run_dir),
+            "cfg_fingerprint": {
+                "dataset": str(cfg.get("dataset", "")),
+                "model": str(cfg.get("model", "")),
+                "training": cfg.get("training", {}),
+                "data_root": cfg.get("data_root"),
+                "data": cfg.get("data", {}),
+            },
+        }
+        (run_dir / "cli_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if args.dry_run:
+            print("DRY RUN: created run dir and manifest, training not started.")
+            print(f"run dir: {run_dir}")
+            return
+
         ckpt_path = train_one_run(cfg, seed=args.seed, out_dir=str(run_dir))
+        print(f"expected metrics: {run_dir / 'metrics.jsonl'}")
+        print(f"expected summary: {run_dir / 'summary.json'}")
+        print(f"checkpoints dir: {run_dir / 'checkpoints'}")
         print(f"saved checkpoint: {ckpt_path}")
         print(f"run dir: {run_dir}")
         return

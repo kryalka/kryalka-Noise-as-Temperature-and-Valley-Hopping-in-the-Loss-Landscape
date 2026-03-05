@@ -11,7 +11,7 @@ data:
 
 training:
   optimizer: sgd
-  epochs: 40
+  epochs: 100
   batch_size: 128
   learning_rate: 0.1
   momentum: 0.9

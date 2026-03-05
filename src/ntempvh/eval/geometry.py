@@ -11,6 +11,21 @@ from ntempvh.models.resnet_cifar import make_model
 from ntempvh.utils.device import get_device
 from ntempvh.utils.io import ensure_dir, load_yaml, save_json
 from ntempvh.eval.metrics import eval_classification, params_to_vector, vector_to_params
+from ntempvh.eval.bn import recalibrate_bn
+import inspect
+import hashlib
+from pathlib import Path
+
+def _short_tag(p: str | Path) -> str:
+    p = Path(p)
+    h = hashlib.sha1(str(p).encode("utf-8")).hexdigest()[:8]
+    return f"{p.stem}__{h}"
+
+def _call_get_cifar10_loaders_safe(**kwargs):
+    sig = inspect.signature(get_cifar10_loaders)
+    allowed = set(sig.parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    return get_cifar10_loaders(**filtered)
 
 
 def _safe_stem(p: Path) -> str:
@@ -41,6 +56,7 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
     alpha = float(gcfg.get("alpha", cfg.get("alpha", 1e-3)))
     m = int(gcfg.get("num_directions", cfg.get("num_directions", 10)))
     eval_batch_size = int(gcfg.get("eval_batch_size", cfg.get("eval_batch_size", 256)))
+    bn_batches = int(gcfg.get("bn_recalib_batches", cfg.get("bn_recalib_batches", 0)))
 
     num_eval_batches = gcfg.get("num_eval_batches", cfg.get("num_eval_batches", None))
     num_eval_batches = int(num_eval_batches) if num_eval_batches is not None else None
@@ -53,18 +69,33 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
 
     data_root = str(cfg.get("data_root", "./data"))
 
-    loaders = get_cifar10_loaders(
+    eval_cfg = cfg.get("evaluation", {}) if isinstance(cfg, dict) else {}
+    if eval_cfg is None:
+        eval_cfg = {}
+
+    data_cfg = cfg.get("data", {}) if isinstance(cfg, dict) else {}
+    if data_cfg is None:
+        data_cfg = {}
+
+
+    loaders = _call_get_cifar10_loaders_safe(
         root=data_root,
-        batch_size=128, 
+        batch_size=eval_batch_size,
         val_batch_size=eval_batch_size,
-        num_workers=0,
-        pin_memory=True,
+        val_size=int(eval_cfg.get("val_size", 5000)),
+        split_seed=int(eval_cfg.get("split_seed", 0)),
+        shuffle_seed=int(eval_cfg.get("split_seed", 0)),
+        num_workers=int(data_cfg.get("num_workers", 0)),
+        pin_memory=bool(data_cfg.get("pin_memory", True)),
     )
     val_loader = loaders.val
+    bn_loader = loaders.bn
 
     model = make_model(model_name, num_classes=10).to(device)
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
+
+    recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
 
     base = eval_classification(model, val_loader, device, max_batches=num_eval_batches)
     L0 = float(base["loss"])
@@ -86,10 +117,12 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
 
         theta_plus = theta0 + eps * u
         vector_to_params(model, theta_plus)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
         Lp = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
 
         theta_minus = theta0 - eps * u
         vector_to_params(model, theta_minus)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
         Lm = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
 
         vector_to_params(model, theta0)
@@ -101,7 +134,9 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
     kappa_std = float(np.std(per_dir, ddof=1)) if len(per_dir) > 1 else 0.0
 
     out_dir = ensure_dir(out_path)
-    tag = _safe_stem(Path(ckpt_path).with_suffix(""))
+    # tag = _safe_stem(Path(ckpt_path).with_suffix(""))
+    # json_path = Path(out_dir) / f"geometry__{tag}.json"
+    tag = _short_tag(ckpt_path)
     json_path = Path(out_dir) / f"geometry__{tag}.json"
 
     out: dict[str, Any] = {
@@ -113,6 +148,7 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
         "num_directions": m,
         "eval_batch_size": eval_batch_size,
         "num_eval_batches": num_eval_batches,
+        "bn_recalib_batches": bn_batches,
         "theta_norm": theta_norm,
         "epsilon": eps,
         "base": base,

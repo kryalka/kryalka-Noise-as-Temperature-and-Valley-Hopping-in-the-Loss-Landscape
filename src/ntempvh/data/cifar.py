@@ -60,10 +60,15 @@ def get_cifar10_loaders(
     num_workers: int = 0,
     pin_memory: bool = True,
     val_batch_size: int = 256,
+    bn_batch_size: int | None = None
 ) -> DataLoaders:
     """
     Возвращает train/val DataLoader'ы CIFAR-10 с фиксированным разбиением 
     """
+
+    bn_bs = int(bn_batch_size) if bn_batch_size is not None else int(val_batch_size)
+
+
     tf_train = _build_transforms(train=True)
     tf_eval = _build_transforms(train=False)
 
@@ -120,7 +125,7 @@ def get_cifar10_loaders(
 
     bn_loader = DataLoader(
         bn_ds,
-        batch_size=int(val_batch_size),
+        batch_size=bn_bs,
         shuffle=False,
         num_workers=int(num_workers),
         pin_memory=bool(pin_memory),

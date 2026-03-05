@@ -133,6 +133,7 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
 
         running_loss = 0.0
         seen = 0
+        correct_train = 0
 
         for x, y in pbar:
             x = x.to(device)
@@ -141,6 +142,8 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
             loss = criterion(logits, y)
+            pred = logits.argmax(dim=1)
+            correct_train += int((pred == y).sum().item())
             loss.backward()
             optimizer.step()
 
@@ -156,17 +159,19 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
 
         val = evaluate(model, loaders.val, device)
         train_loss_ep = running_loss / max(1, seen)
+        train_acc_ep = correct_train / max(1, seen)
 
         logger.log({
             "epoch": int(ep),
             "train_loss": float(train_loss_ep),
+            "train_acc": float(train_acc_ep),
             "val_loss": float(val["val_loss"]),
             "val_acc": float(val["val_acc"]),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "seconds_elapsed": float(time.time() - t0),
         })
 
-        print(f"[ep {ep:03d}] val_loss={val['val_loss']:.4f} val_acc={val['val_acc']:.4f}")
+        print(f"[ep {ep:03d}] val_loss={val['val_loss']:.4f} val_acc={val['val_acc']:.4f} train_acc={train_acc_ep:.4f}")
 
         if save_best and val["val_loss"] < best_val_loss:
             best_val_loss = float(val["val_loss"])
