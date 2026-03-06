@@ -1,0 +1,18 @@
+base_config: configs/train/sgd_base.yaml
+out_root: outputs/runs_lr_bs_grid
+
+seeds:
+  - 1
+  - 2
+
+learning_rates:
+  - 0.025
+  - 0.05 
+  - 0.1
+  - 0.2 
+
+batch_sizes:
+  - 32
+  - 64
+  - 128
+  - 256

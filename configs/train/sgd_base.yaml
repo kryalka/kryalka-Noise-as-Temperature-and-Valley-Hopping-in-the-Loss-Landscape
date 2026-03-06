@@ -7,7 +7,7 @@ data:
   val_size: 5000
   split_seed: 42
   num_workers: 0
-  pin_memory: true
+  pin_memory: false
 
 training:
   optimizer: sgd
@@ -22,3 +22,4 @@ training:
 logging:
   save_every_epochs: 1
   save_final: true
+  save_best: true
