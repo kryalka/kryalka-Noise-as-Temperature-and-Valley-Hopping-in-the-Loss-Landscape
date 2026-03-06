@@ -2,7 +2,7 @@ data_root: ./data
 
 path:
   type: linear        
-  num_points: 41
+  num_points: 21
   bn_recalib_batches: 20
   pivots: []   
 

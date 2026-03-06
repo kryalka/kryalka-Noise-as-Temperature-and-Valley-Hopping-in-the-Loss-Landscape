@@ -1,12 +1,11 @@
 geometry:
   alpha: 1e-3
-  num_directions: 10
+  num_directions: 40
   eval_batch_size: 256
   num_eval_batches: null
   bn_recalib_batches: 20
 
 evaluation:
-  split: val
   val_size: 5000
   split_seed: 42
 
