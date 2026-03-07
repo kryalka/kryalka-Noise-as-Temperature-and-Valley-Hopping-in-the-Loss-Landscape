@@ -48,6 +48,7 @@ def _call_get_cifar10_loaders_safe(**kwargs):
     filtered = {k: v for k, v in kwargs.items() if k in allowed}
     return get_cifar10_loaders(**filtered)
 
+
 def _save_checkpoint(
     ckpt_dir: Path,
     tag: str,
@@ -125,6 +126,8 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
 
     best_val_loss = float("inf")
     best_ckpt_path: Optional[Path] = None
+    best_epoch: Optional[int] = None
+    last_val: Optional[Dict[str, float]] = None
 
     t0 = time.time()
     for ep in range(1, epochs + 1):
@@ -141,7 +144,7 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(x)
-            loss = criterion(logits, y)
+            loss = criterion(logits, y) 
             pred = logits.argmax(dim=1)
             correct_train += int((pred == y).sum().item())
             loss.backward()
@@ -158,6 +161,7 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
         step_scheduler(scheduler)
 
         val = evaluate(model, loaders.val, device)
+        last_val = val
         train_loss_ep = running_loss / max(1, seen)
         train_acc_ep = correct_train / max(1, seen)
 
@@ -175,6 +179,7 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
 
         if save_best and val["val_loss"] < best_val_loss:
             best_val_loss = float(val["val_loss"])
+            best_epoch = ep
             best_ckpt_path = _save_checkpoint(
                 ckpt_dir,
                 "best",
@@ -228,11 +233,15 @@ def train_one_run(config: Dict[str, Any], seed: int, out_dir: str) -> Path:
         )
 
     save_json(out_path / "summary.json", {
+        "seed": int(seed),
         "epochs": int(epochs),
         "seconds_total": float(time.time() - t0),
         "final_checkpoint": str(final_ckpt_path),
         "best_checkpoint": str(best_ckpt_path) if best_ckpt_path is not None else None,
         "best_val_loss": float(best_val_loss) if best_val_loss < float("inf") else None,
+        "best_epoch": int(best_epoch) if best_epoch is not None else None,
+        "final_val_loss": float(last_val["val_loss"]) if last_val is not None else None,
+        "final_val_acc": float(last_val["val_acc"]) if last_val is not None else None,
         "save_every_epochs": int(save_every_epochs),
         "data": {
             "data_root": data_root,
