@@ -3,9 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+import time
+
 import numpy as np
 import torch
-
+from ntempvh.utils.seed import set_seed
 from ntempvh.data.cifar import get_cifar10_loaders
 from ntempvh.models.resnet_cifar import make_model
 from ntempvh.utils.device import get_device
@@ -42,6 +45,48 @@ def _sample_unit_directions(
     z_norm = torch.norm(z, dim=1, keepdim=True).clamp_min(1e-12)
     return z / z_norm
 
+def _save_failure_json(
+    *,
+    out_dir: str | Path,
+    ckpt_path: str,
+    model_name: str,
+    dataset_name: str,
+    device: torch.device,
+    alpha: float,
+    m: int,
+    eval_batch_size: int,
+    num_eval_batches: int | None,
+    bn_batches: int,
+    raw_base: dict | None,
+    bn_base: dict | None,
+    reason: str,
+    extra: dict | None = None,
+) -> Path:
+    out_dir = ensure_dir(out_dir)
+    tag = _short_tag(ckpt_path)
+    fail_path = Path(out_dir) / f"geometry_failed__{tag}.json"
+
+    payload: dict[str, Any] = {
+        "status": "failed",
+        "reason": reason,
+        "ckpt": str(ckpt_path),
+        "dataset": dataset_name,
+        "model": model_name,
+        "device": str(device),
+        "alpha": alpha,
+        "num_directions": m,
+        "eval_batch_size": eval_batch_size,
+        "num_eval_batches": num_eval_batches,
+        "bn_recalib_batches": bn_batches,
+        "raw_base": raw_base,
+        "bn_base": bn_base,
+    }
+    if extra:
+        payload["extra"] = extra
+
+    save_json(fail_path, payload)
+    return fail_path
+
 
 @torch.no_grad()
 def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> Path:
@@ -64,6 +109,9 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
     device = get_device()
 
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    seed = int(ckpt.get("seed", 0))      
+    set_seed(seed) 
+    
     model_name = str(ckpt["model"]).lower()
     dataset_name = str(ckpt.get("dataset", "")).lower()
 
@@ -95,10 +143,54 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
     model.load_state_dict(ckpt["state_dict"], strict=True)
     model.eval()
 
-    recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
-
+    raw_base = eval_classification(model, val_loader, device, max_batches=num_eval_batches)
+    # print("raw_base:", raw_base)
+    recalibrate_bn(model, bn_loader, device, num_batches=bn_batches, reset_stats=False)
     base = eval_classification(model, val_loader, device, max_batches=num_eval_batches)
-    L0 = float(base["loss"])
+    # print("bn_base:", base)
+
+    base_loss = float(base["loss"])
+    base_acc = float(base["acc"])
+
+    if not np.isfinite(base_loss) or not np.isfinite(base_acc):
+        fail_path = _save_failure_json(
+            out_dir=out_path,
+            ckpt_path=ckpt_path,
+            model_name=model_name,
+            dataset_name=dataset_name,
+            device=device,
+            alpha=alpha,
+            m=m,
+            eval_batch_size=eval_batch_size,
+            num_eval_batches=num_eval_batches,
+            bn_batches=bn_batches,
+            raw_base=raw_base,
+            bn_base=base,
+            reason="non_finite_bn_base",
+        )
+
+    if base_acc < 0.2 or base_loss > 2.5:
+        fail_path = _save_failure_json(
+            out_dir=out_path,
+            ckpt_path=ckpt_path,
+            model_name=model_name,
+            dataset_name=dataset_name,
+            device=device,
+            alpha=alpha,
+            m=m,
+            eval_batch_size=eval_batch_size,
+            num_eval_batches=num_eval_batches,
+            bn_batches=bn_batches,
+            raw_base=raw_base,
+            bn_base=base,
+            reason="unstable_bn_recalibration",
+            extra={
+                "threshold_acc_min": 0.2,
+                "threshold_loss_max": 2.5,
+            },
+        )
+
+    L0 = base_loss
 
     theta0 = params_to_vector(model).detach().to(device)
     dtype = theta0.dtype
@@ -106,23 +198,27 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
     theta_norm = float(torch.norm(theta0).item())
     eps = float(alpha * theta_norm)
     if not np.isfinite(eps) or eps <= 0.0:
-        raise ValueError(f"Bad epsilon computed: eps={eps}, alpha={alpha}, ||theta||={theta_norm}")
+        raise ValueError(f"Bad epsilon: eps={eps}, alpha={alpha}, ||theta||={theta_norm}")
 
     d = int(theta0.numel())
     U = _sample_unit_directions(d, m, device=device, dtype=dtype)
 
     per_dir: list[float] = []
-    for i in range(m):
+    start_total = time.time()
+
+    pbar = tqdm(range(m), desc="geometry directions")
+    for i in pbar:
+        dir_start = time.time()
         u = U[i]
 
         theta_plus = theta0 + eps * u
         vector_to_params(model, theta_plus)
-        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches, reset_stats=False)
         Lp = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
 
         theta_minus = theta0 - eps * u
         vector_to_params(model, theta_minus)
-        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches)
+        recalibrate_bn(model, bn_loader, device, num_batches=bn_batches, reset_stats=False)
         Lm = float(eval_classification(model, val_loader, device, max_batches=num_eval_batches)["loss"])
 
         vector_to_params(model, theta0)
@@ -130,12 +226,21 @@ def compute_geometry(ckpt_path: str, geometry_cfg_path: str, out_path: str) -> P
         sec = (Lp + Lm - 2.0 * L0) / (eps * eps)
         per_dir.append(float(sec))
 
+        elapsed_dir = time.time() - dir_start
+        elapsed_total = time.time() - start_total
+        avg_dir = elapsed_total / (i + 1)
+        eta = avg_dir * (m - i - 1)
+
+        pbar.set_postfix(
+            dir_sec=f"{elapsed_dir:.1f}s",
+            eta_min=f"{eta / 60:.1f}",
+            last_sec=f"{sec:.3e}",
+        )
+
     kappa_tr = float(np.mean(per_dir)) if len(per_dir) > 0 else float("nan")
     kappa_std = float(np.std(per_dir, ddof=1)) if len(per_dir) > 1 else 0.0
 
     out_dir = ensure_dir(out_path)
-    # tag = _safe_stem(Path(ckpt_path).with_suffix(""))
-    # json_path = Path(out_dir) / f"geometry__{tag}.json"
     tag = _short_tag(ckpt_path)
     json_path = Path(out_dir) / f"geometry__{tag}.json"
 

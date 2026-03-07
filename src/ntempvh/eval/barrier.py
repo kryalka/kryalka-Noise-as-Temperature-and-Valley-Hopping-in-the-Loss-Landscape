@@ -4,10 +4,68 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
+from ntempvh.utils.seed import set_seed
 from ntempvh.utils.io import load_yaml, save_json
 import hashlib
 from pathlib import Path
+import re
+from pathlib import Path
+
+RUN_RE = re.compile(
+    r"""
+    seed(?P<seed>\d+)
+    __opt(?P<optimizer>[^_]+)
+    _lr(?P<lr>[^_]+)
+    _bs(?P<bs>[^_]+)
+    _wd(?P<wd>[^_]+)
+    _mom(?P<mom>[^_]+)
+    _sch(?P<scheduler>[^_]+)
+    __(?P<hash>[a-f0-9]+)
+    """,
+    re.VERBOSE,
+)
+
+EPOCH_RE = re.compile(r"^epoch_(\d+)\.pt$")
+
+
+def _parse_ckpt_path(ckpt_path: str | Path) -> dict:
+    p = Path(ckpt_path)
+    run_name = p.parent.parent.name
+
+    m = RUN_RE.search(run_name)
+    em = EPOCH_RE.match(p.name)
+
+    g = m.groupdict()
+    return {
+        "run_name": run_name,
+        "seed": int(g["seed"]),
+        "learning_rate": float(g["lr"]),
+        "batch_size": int(g["bs"]),
+        "epoch": int(em.group(1)),
+    }
+
+
+def _lr_to_str(x: float) -> str:
+    return f"{x:g}"
+
+
+def _pair_tag_from_meta(meta: dict[str, Any]) -> str:
+    a = _parse_ckpt_path(meta["ckptA"])
+    b = _parse_ckpt_path(meta["ckptB"])
+
+    if a["run_name"] != b["run_name"]:
+        raise ValueError(
+            f"Barrier expects interpolation within one run, got:\\n"
+            f"  {meta['ckptA']}\\n"
+            f"  {meta['ckptB']}"
+        )
+
+    return (
+        f"lr{_lr_to_str(a['learning_rate'])}"
+        f"__bs{a['batch_size']}"
+        f"__seed{a['seed']}"
+        f"__e{a['epoch']:03d}_e{b['epoch']:03d}"
+    )
 
 def _short_tag(p: str | Path) -> str:
     p = Path(p)
@@ -66,7 +124,7 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
     bcfg = cfg.get("barrier", {}) if isinstance(cfg, dict) else {}
 
     definition = str(bcfg.get("definition", "max_minus_endpoints"))
-    thresholds = [float(x) for x in bcfg.get("thresholds", [0.01, 0.05, 0.1])]
+    thresholds = [float(x) for x in bcfg.get("thresholds", [0.005, 0.01, 0.05, 0.1, 0.2, 0.35, 0.5])]
 
     t, L, acc = _parse_interp_csv(interp_csv)
     meta = None
@@ -77,10 +135,17 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             meta = None
-    # deltaL, L0, L1 = _compute_deltaL(t, L, definition=definition)
-    # max_L = float(L.max())
-    # peak_idx = int(L.argmax())
-    # peak_t = float(t[peak_idx])
+
+    seed = 0
+    if isinstance(meta, dict):
+        if meta.get("seed_A") is not None:
+            seed = int(meta["seed_A"])
+        elif meta.get("seed_B") is not None:
+            seed = int(meta["seed_B"])
+        elif isinstance(meta.get("evaluation"), dict) and meta["evaluation"].get("split_seed") is not None:
+            seed = int(meta["evaluation"]["split_seed"])
+
+    set_seed(seed)
     deltaL, L0, L1 = _compute_deltaL(t, L, definition=definition)
 
     d = (definition or "").strip().lower()
@@ -123,14 +188,10 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
     out_dir = Path(out_path)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    interp_p = Path(interp_csv)
-    # tag = _safe_stem(interp_p.with_suffix(""))
-    # json_path = out_dir / f"barrier__{tag}.json"
-    tag = _short_tag(Path(interp_csv).with_suffix(""))
-    json_path = out_dir / f"barrier__{tag}.json"
+    pair_tag = _pair_tag_from_meta(meta)
+    json_path = out_dir / f"barrier__{pair_tag}.json"
     save_json(json_path, out)
 
-    # csv_path = out_dir / "barriers.csv"
     thr_sig = "_".join([str(x).replace(".", "p") for x in thresholds])
     def_sig = (definition or "").strip().lower().replace(" ", "_")
     csv_path = out_dir / f"barriers__{def_sig}__thr_{thr_sig}.csv"
@@ -149,11 +210,10 @@ def compute_barrier(interp_csv: str, barrier_cfg_path: str, out_path: str) -> Pa
         f"{deltaL_rel:.10g}",
     ] + [str(int(jumps[str(th)])) for th in thresholds]
 
-    # if not csv_path.exists():
-    #     csv_path.write_text(header + "\n", encoding="utf-8")
-    # with open(csv_path, "a", encoding="utf-8") as f:
-    #     f.write(",".join(row) + "\n")
-
+    if not csv_path.exists():
+        csv_path.write_text(header + "\n", encoding="utf-8")
+    with open(csv_path, "a", encoding="utf-8") as f:
+        f.write(",".join(row) + "\n")
 
     legacy_csv_path = out_dir / "barriers.csv"
 

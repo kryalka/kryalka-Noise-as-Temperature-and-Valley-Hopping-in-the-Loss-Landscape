@@ -11,17 +11,30 @@ def recalibrate_bn(
     device: torch.device,
     *,
     num_batches: int = 50,
+    reset_stats: bool = False,
 ) -> None:
     """
-    Обновление running_mean / running_var у BatchNorm слоёв под текущие веса модели.
-    Модель в eval, но BN-слои в train (обновятся running stats без dropout).
+    Пересчет running_mean / running_var у BatchNorm-слоев.
+
+    reset_stats=True:
+        пересчет stats с нуля (через cumulative average, momentum=None)
+
+    reset_stats=False:
+        подстройка от текущих stats
     """
     bn_layers = [m for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)]
     if not bn_layers or num_batches <= 0 or loader is None:
         return
 
+    was_training = model.training
+    saved_momenta = {}
+
     model.eval()
     for m in bn_layers:
+        saved_momenta[m] = m.momentum
+        if reset_stats:
+            m.reset_running_stats()
+            m.momentum = None
         m.train()
 
     batches = 0
@@ -32,4 +45,7 @@ def recalibrate_bn(
         if batches >= num_batches:
             break
 
-    model.eval()
+    for m in bn_layers:
+        m.momentum = saved_momenta[m]
+
+    model.train(was_training)
