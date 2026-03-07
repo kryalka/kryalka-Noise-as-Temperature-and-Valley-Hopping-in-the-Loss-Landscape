@@ -11,9 +11,6 @@ from ntempvh.eval.geometry import compute_geometry
 import hashlib
 import json
 
-# def _timestamp() -> str:
-#     return datetime.now().strftime("%Y%m%d_%H%M%S")
-
 def _short_hash(obj) -> str:
     s = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
@@ -30,7 +27,6 @@ def _format_run_id(cfg: dict, seed: int) -> str:
     mom = tr.get("momentum", "na")
     sch = str(tr.get("scheduler", "none")).lower()
 
-    # h = _short_hash({"cfg": cfg, "seed": int(seed)})
     fingerprint = {
         "dataset": dataset,
         "model": model,
@@ -57,37 +53,25 @@ def main():
     p_interp.add_argument("--ckptA", required=True)
     p_interp.add_argument("--ckptB", required=True)
     p_interp.add_argument("--config", required=True) 
-    # p_interp.add_argument("--out", default="outputs/figures/interp")
     p_interp.add_argument("--out", default="outputs/artifacts/interp")
 
     p_bar = sub.add_parser("barrier", help="Compute barrier from interpolation csv")
     p_bar.add_argument("--interp_csv", required=True)
     p_bar.add_argument("--config", required=True)  
-    # p_bar.add_argument("--out", default="outputs/tables")
     p_bar.add_argument("--out", default="outputs/artifacts/barrier")
 
     p_geo = sub.add_parser("geometry", help="Compute proxy geometry (curvature) at a checkpoint")
     p_geo.add_argument("--ckpt", required=True)
     p_geo.add_argument("--config", required=True)
-    # p_geo.add_argument("--out", default="outputs/tables")
     p_geo.add_argument("--out", default="outputs/artifacts/geometry")
 
     args = ap.parse_args()
 
     if args.cmd == "train":
         cfg = load_yaml(args.config)
+        train_cfg = cfg.get("training", {}) or {}
 
-        train_cfg = cfg.get("training", {})
-        if train_cfg.get("batch_size") in (None, "TBD"):
-            train_cfg["batch_size"] = 128
-        if train_cfg.get("learning_rate") in (None, "TBD"):
-            train_cfg["learning_rate"] = 0.1
         cfg["training"] = train_cfg
-
-        # run_id = f"{cfg['dataset']}_{cfg['model']}_seed{args.seed}"
-        # base_out = ensure_dir(Path(args.out))
-        # run_dir = ensure_dir(base_out / f"{run_id}")
-
         run_id = _format_run_id(cfg, args.seed)
         base_out = ensure_dir(Path(args.out))
         run_dir = ensure_dir(base_out / run_id)
