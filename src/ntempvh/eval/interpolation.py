@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-from pathlib import Path
 import inspect
 
 import numpy as np
@@ -155,7 +153,9 @@ def _call_get_cifar10_loaders_safe(**kwargs):
 def _validate_ckpt_pair(A: dict, B: dict) -> None:
     model_a = str(A.get("model", "")).lower()
     model_b = str(B.get("model", "")).lower()
-    
+    if model_a != model_b:
+        raise ValueError(f"Checkpoint model mismatch: {model_a} vs {model_b}")
+
     ds_a = str(A.get("dataset", "")).lower()
     ds_b = str(B.get("dataset", "")).lower()
     if ds_a != ds_b:
@@ -163,6 +163,13 @@ def _validate_ckpt_pair(A: dict, B: dict) -> None:
 
     sda = A["state_dict"]
     sdb = B["state_dict"]
+
+    if list(sda.keys()) != list(sdb.keys()):
+        raise ValueError("State dict keys do not match between checkpoints")
+
+    for k in sda.keys():
+        if sda[k].shape != sdb[k].shape:
+            raise ValueError(f"Shape mismatch for key {k}: {sda[k].shape} vs {sdb[k].shape}")
 
 
 def run_interpolation(ckpt_a: str, ckpt_b: str, config_path: str, out_dir: str) -> Path:

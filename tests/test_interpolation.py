@@ -8,7 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-
+from textwrap import dedent
 from ntempvh.eval.interpolation import run_interpolation
 
 
@@ -54,23 +54,35 @@ def _make_dummy_loaders(
 
 
 def _write_interp_cfg(path: Path, *, data_root: str, num_points: int, eval_batch_size: int) -> None:
-    text = f"""\
-        data_root: {data_root}
+    text = dedent(f"""\
+    data_root: {data_root}
 
-        path:
-        type: linear
-        num_points: {num_points}
+    path:
+      type: linear
+      num_points: {num_points}
 
-        evaluation:
-        model_mode: eval
-        batch_size: {eval_batch_size}
+    evaluation:
+      model_mode: eval
+      batch_size: {eval_batch_size}
 
-        metrics:
-        - val_loss
-        - val_accuracy
-        """
+    metrics:
+      - val_loss
+      - val_accuracy
+    """)
     path.write_text(text, encoding="utf-8")
 
+def _write_fake_ckpt(
+    *,
+    root: Path,
+    run_name: str,
+    epoch: int,
+    payload: dict,
+) -> Path:
+    ckpt_dir = root / "outputs" / "runs_lr_bs_grid" / run_name / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+    torch.save(payload, ckpt_path)
+    return ckpt_path
 
 @torch.no_grad()
 def _eval_like_module(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
@@ -117,13 +129,35 @@ def test_run_interpolation_uses_config_and_writes_csv(tmp_path: Path, monkeypatc
     torch.manual_seed(1)
     modelB = _TinyNet(num_classes=10)
 
-    ckptA = {"model": "resnet18", "dataset": "cifar10", "seed": 0, "epoch": 1, "state_dict": modelA.state_dict()}
-    ckptB = {"model": "resnet18", "dataset": "cifar10", "seed": 1, "epoch": 1, "state_dict": modelB.state_dict()}
+    run_name = "cifar10_resnet18_seed1__optsgd_lr0.1_bs128_wd0.0005_mom0.9_schnone__dummy"
 
-    ckptA_path = tmp_path / "A.pt"
-    ckptB_path = tmp_path / "B.pt"
-    torch.save(ckptA, ckptA_path)
-    torch.save(ckptB, ckptB_path)
+    ckptA = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 1,
+        "state_dict": modelA.state_dict(),
+    }
+    ckptB = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 10,
+        "state_dict": modelB.state_dict(),
+    }
+
+    ckptA_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=1,
+        payload=ckptA,
+    )
+    ckptB_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=10,
+        payload=ckptB,
+    )
 
     cfg_path = tmp_path / "interpolation.yaml"
     _write_interp_cfg(cfg_path, data_root=expected_root, num_points=num_points, eval_batch_size=expected_eval_bs)
@@ -174,12 +208,35 @@ def test_run_interpolation_endpoints_match_manual_eval(tmp_path: Path, monkeypat
     torch.manual_seed(456)
     modelB = _TinyNet(num_classes=10)
 
-    ckptA = {"model": "resnet18", "dataset": "cifar10", "seed": 0, "epoch": 1, "state_dict": modelA.state_dict()}
-    ckptB = {"model": "resnet18", "dataset": "cifar10", "seed": 1, "epoch": 1, "state_dict": modelB.state_dict()}
-    ckptA_path = tmp_path / "A.pt"
-    ckptB_path = tmp_path / "B.pt"
-    torch.save(ckptA, ckptA_path)
-    torch.save(ckptB, ckptB_path)
+    run_name = "cifar10_resnet18_seed1__optsgd_lr0.1_bs128_wd0.0005_mom0.9_schnone__dummy"
+
+    ckptA = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 1,
+        "state_dict": modelA.state_dict(),
+    }
+    ckptB = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 10,
+        "state_dict": modelB.state_dict(),
+    }
+
+    ckptA_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=1,
+        payload=ckptA,
+    )
+    ckptB_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=10,
+        payload=ckptB,
+    )
 
     cfg_path = tmp_path / "interpolation.yaml"
     _write_interp_cfg(cfg_path, data_root=expected_root, num_points=num_points, eval_batch_size=eval_bs)

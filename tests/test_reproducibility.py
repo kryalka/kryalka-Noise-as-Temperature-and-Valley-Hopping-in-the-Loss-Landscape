@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from ntempvh.train.trainer import train_one_run
 from ntempvh.eval.interpolation import run_interpolation
+from textwrap import dedent
 
 
 @dataclass
@@ -78,20 +79,35 @@ def _base_train_cfg(*, epochs: int = 2, batch_size: int = 16, lr: float = 0.1) -
 
 
 def _write_interp_cfg(path: Path, *, data_root: str, num_points: int, eval_batch_size: int) -> None:
-    text = f"""\
-        data_root: {data_root}
-        path:
-        type: linear
-        num_points: {num_points}
-        evaluation:
-        model_mode: eval
-        batch_size: {eval_batch_size}
-        metrics:
-        - val_loss
-        - val_accuracy
-        """
+    text = dedent(f"""\
+    data_root: {data_root}
+
+    path:
+      type: linear
+      num_points: {num_points}
+
+    evaluation:
+      model_mode: eval
+      batch_size: {eval_batch_size}
+
+    metrics:
+      - val_loss
+      - val_accuracy
+    """)
     path.write_text(text, encoding="utf-8")
 
+def _write_fake_ckpt(
+    *,
+    root: Path,
+    run_name: str,
+    epoch: int,
+    payload: dict,
+) -> Path:
+    ckpt_dir = root / "outputs" / "runs_lr_bs_grid" / run_name / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"epoch_{epoch:03d}.pt"
+    torch.save(payload, ckpt_path)
+    return ckpt_path
 
 def _state_dict_allclose(sd1: dict, sd2: dict, *, atol: float = 0.0, rtol: float = 0.0) -> bool:
     if sd1.keys() != sd2.keys():
@@ -167,10 +183,35 @@ def test_interpolation_deterministic_given_fixed_ckpts_and_data(tmp_path: Path, 
     torch.manual_seed(1)
     modelB = _TinyNet(num_classes=10)
 
-    ckptA_path = tmp_path / "A.pt"
-    ckptB_path = tmp_path / "B.pt"
-    torch.save({"model": "resnet18", "dataset": "cifar10", "state_dict": modelA.state_dict()}, ckptA_path)
-    torch.save({"model": "resnet18", "dataset": "cifar10", "state_dict": modelB.state_dict()}, ckptB_path)
+    run_name = "cifar10_resnet18_seed1__optsgd_lr0.1_bs128_wd0.0005_mom0.9_schnone__dummy"
+
+    ckptA = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 1,
+        "state_dict": modelA.state_dict(),
+    }
+    ckptB = {
+        "model": "resnet18",
+        "dataset": "cifar10",
+        "seed": 1,
+        "epoch": 10,
+        "state_dict": modelB.state_dict(),
+    }
+
+    ckptA_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=1,
+        payload=ckptA,
+    )
+    ckptB_path = _write_fake_ckpt(
+        root=tmp_path,
+        run_name=run_name,
+        epoch=10,
+        payload=ckptB,
+    )
 
     cfg_path = tmp_path / "interpolation.yaml"
     _write_interp_cfg(cfg_path, data_root="IGNORED", num_points=7, eval_batch_size=16)
