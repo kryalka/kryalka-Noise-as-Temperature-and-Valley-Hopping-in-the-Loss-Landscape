@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from ntempvh.eval.geometry import compute_geometry
+from textwrap import dedent
 
 
 @dataclass
@@ -56,14 +57,15 @@ def _make_dummy_loaders(
 
 
 def _write_geometry_cfg(path: Path) -> None:
-    text = """\
-        data_root: ./data
-        geometry:
-        alpha: 1e-3
-        num_directions: 2
-        eval_batch_size: 16
-        num_eval_batches: 1
-        """
+    text = dedent("""\
+    data_root: ./data
+
+    geometry:
+      alpha: 1e-3
+      num_directions: 2
+      eval_batch_size: 16
+      num_eval_batches: 1
+    """)
     path.write_text(text, encoding="utf-8")
 
 
